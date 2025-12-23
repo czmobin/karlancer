@@ -35,6 +35,12 @@ output_*.tmp
 proposals/
 analyzed_projects.json
 
+# Continuous bot
+continuous_bot.log
+continuous_tracking.json
+bot.pid
+bot.log
+
 # OS
 .DS_Store
 Thumbs.db
