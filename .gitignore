@@ -25,6 +25,15 @@ env/
 *.log
 debug.log
 fetcher.log
+analyzer.log
+
+# Analyzer temporary files
+temp_*.txt
+output_*.tmp
+
+# Analysis results
+proposals/
+analyzed_projects.json
 
 # OS
 .DS_Store
