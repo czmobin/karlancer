@@ -41,6 +41,10 @@ continuous_tracking.json
 bot.pid
 bot.log
 
+# Backup files
+*_old.py
+*_backup.py
+
 # OS
 .DS_Store
 Thumbs.db
