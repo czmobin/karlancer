@@ -300,21 +300,46 @@ class ContinuousKarlancer:
         return None
 
     def submit_proposal(self, project_id: int, analysis_file: Path):
-        """ارسال proposal (اختیاری)"""
+        """ارسال proposal"""
         if not self.auto_submit:
             self.log_info(f"ارسال خودکار غیرفعال است - پروژه {project_id} آماده ارسال دستی")
             return False
 
         try:
-            self.log_info(f"ارسال proposal برای پروژه {project_id}...")
+            self.log_info(f"📤 ارسال خودکار proposal برای پروژه {project_id}...")
 
-            # اینجا کد submit_proposal.py رو صدا می‌زنیم
-            # فعلاً فقط لاگ می‌کنیم
-            self.log_warning("ارسال خودکار هنوز پیاده‌سازی نشده - لطفاً دستی ارسال کنید")
-            return False
+            # Import ProposalSubmitter
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from submit_proposal import ProposalSubmitter
+
+            submitter = ProposalSubmitter(self.bearer_token)
+
+            # استخراج proposal
+            proposal = submitter.extract_proposal_from_analysis(str(analysis_file))
+
+            if not proposal:
+                self.log_error(f"نمی‌توان proposal از فایل {analysis_file} استخراج کرد")
+                return False
+
+            # ارسال
+            result = submitter.submit_proposal(
+                project_id=project_id,
+                description=proposal,
+                analysis_file=str(analysis_file)
+            )
+
+            if result['success']:
+                self.log_success(f"✅ پروژه {project_id} با موفقیت ارسال شد!")
+                return True
+            else:
+                self.log_error(f"خطا در ارسال پروژه {project_id}: {result['error']}")
+                return False
 
         except Exception as e:
             self.log_error(f"خطا در ارسال proposal: {e}")
+            import traceback
+            self.log_error(traceback.format_exc())
             return False
 
     def process_new_projects(self):
