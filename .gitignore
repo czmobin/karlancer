@@ -1,0 +1,31 @@
+# Test outputs
+test_output/
+
+# Cache files
+seen_projects.json
+*.pyc
+__pycache__/
+
+# Project data directories
+new_projects/
+claude_input/
+
+# Python virtual environment
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+debug.log
+fetcher.log
+
+# OS
+.DS_Store
+Thumbs.db
