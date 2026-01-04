@@ -29,7 +29,7 @@ os.environ['LC_ALL'] = 'C.UTF-8'
 class ContinuousKarlancer:
     """ربات مداوم کارلنسر"""
 
-    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False):
+    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4):
         """
         مقداردهی اولیه
 
@@ -37,10 +37,38 @@ class ContinuousKarlancer:
             bearer_token: توکن API
             check_interval: فاصله زمانی بررسی (ثانیه) - پیش‌فرض 5 دقیقه
             auto_submit: ارسال خودکار proposal (پیش‌فرض: False)
+            min_stars: حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4
         """
         self.bearer_token = bearer_token
         self.check_interval = check_interval
         self.auto_submit = auto_submit
+        self.min_stars = min_stars
+
+        # تکنولوژی‌ها و کلمات کلیدی که باید رد بشن
+        self.tech_blacklist = [
+            'wordpress', 'wp', 'woocommerce',
+            'shopify',
+            'php',  # اگر pure PHP باشه
+            'magento',
+            'joomla',
+            'drupal',
+            'react', 'vue', 'angular',  # pure frontend
+            'flutter', 'react native',  # mobile development
+            'ios', 'swift', 'android studio',
+            '.net', 'c#',
+            'java', 'spring',
+        ]
+
+        # کلمات کلیدی مثبت که باید داشته باشه
+        self.tech_whitelist = [
+            'python', 'django', 'fastapi', 'flask',
+            'telegram', 'bot', 'ربات',
+            'backend', 'api', 'rest',
+            'postgresql', 'postgres', 'mongodb', 'redis',
+            'celery', 'rabbitmq',
+            'scraping', 'scrapy', 'beautifulsoup',
+            'automation',
+        ]
 
         self.api_url = "https://www.karlancer.com/api/publics/search/projects"
         self.headers = {
@@ -212,6 +240,113 @@ class ContinuousKarlancer:
             self.log_error(f"خطا در ذخیره پروژه {project.get('id')}: {e}")
             return None
 
+    def check_tech_compatibility(self, project: dict):
+        """بررسی سازگاری تکنولوژی پروژه"""
+        title = project.get('title', '').lower()
+        description = project.get('description', '').lower()
+        skills = [s.get('name', '').lower() for s in project.get('skills', [])]
+
+        combined_text = f"{title} {description} {' '.join(skills)}"
+
+        # بررسی blacklist
+        for tech in self.tech_blacklist:
+            if tech.lower() in combined_text:
+                self.log_warning(f"⚠️  تکنولوژی نامناسب پیدا شد: {tech}")
+                return False, f"Contains blacklisted tech: {tech}"
+
+        # بررسی whitelist - حداقل یکی باید باشه
+        found_match = False
+        for tech in self.tech_whitelist:
+            if tech.lower() in combined_text:
+                found_match = True
+                break
+
+        if not found_match:
+            self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد")
+            return False, "No relevant technology found"
+
+        return True, "Compatible"
+
+    def extract_recommendation_rating(self, analysis_file: Path):
+        """استخراج امتیاز توصیه از فایل تحلیل"""
+        try:
+            with open(analysis_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # جستجوی الگوی ستاره‌ها
+            import re
+
+            # پیدا کردن بخش توصیه
+            recommendation_section = re.search(r'(?:🎯|###)\s*توصیه.*?(?=(?:###|📝|💰|$))', content, re.DOTALL | re.IGNORECASE)
+
+            if recommendation_section:
+                section_text = recommendation_section.group(0)
+
+                # شمارش ستاره‌ها
+                stars = section_text.count('⭐')
+
+                # جستجوی توصیه (Take/Skip/Negotiate)
+                decision = None
+                if re.search(r'\b(skip|رد کن|نزن)\b', section_text, re.IGNORECASE):
+                    decision = "Skip"
+                elif re.search(r'\b(take|قبول کن|بزن)\b', section_text, re.IGNORECASE):
+                    decision = "Take"
+                elif re.search(r'\b(negotiate|مذاکره)\b', section_text, re.IGNORECASE):
+                    decision = "Negotiate"
+
+                return {
+                    'stars': stars,
+                    'decision': decision,
+                    'section': section_text[:200]
+                }
+
+            return None
+
+        except Exception as e:
+            self.log_error(f"خطا در استخراج امتیاز توصیه: {e}")
+            return None
+
+    def should_submit_proposal(self, project: dict, analysis_file: Path):
+        """تصمیم‌گیری هوشمند برای ارسال پروپوزال"""
+
+        # ۱. بررسی سازگاری تکنولوژی
+        is_compatible, tech_reason = self.check_tech_compatibility(project)
+
+        if not is_compatible:
+            self.log_warning(f"❌ پروژه {project.get('id')} رد شد: {tech_reason}")
+            return False, tech_reason
+
+        # ۲. استخراج امتیاز توصیه Claude
+        recommendation = self.extract_recommendation_rating(analysis_file)
+
+        if not recommendation:
+            self.log_warning(f"⚠️  نمی‌توان امتیاز توصیه را پیدا کرد - رد می‌شود")
+            return False, "Could not extract recommendation"
+
+        stars = recommendation.get('stars', 0)
+        decision = recommendation.get('decision', '')
+
+        self.log_info(f"📊 امتیاز توصیه: {'⭐' * stars} ({stars}/5) - تصمیم: {decision}")
+
+        # ۳. بررسی امتیاز ستاره
+        if stars < self.min_stars:
+            self.log_warning(f"❌ امتیاز کم ({stars} < {self.min_stars}) - رد می‌شود")
+            return False, f"Rating too low: {stars} stars"
+
+        # ۴. بررسی تصمیم صریح
+        if decision == "Skip":
+            self.log_warning(f"❌ Claude توصیه کرده این پروژه رو رد کنی")
+            return False, "Claude recommended to skip"
+
+        # ۵. بررسی بودجه
+        min_budget = project.get('min_budget', 0)
+        if min_budget < 1_500_000:  # کمتر از 1.5 میلیون
+            self.log_warning(f"❌ بودجه خیلی کم: {min_budget:,} تومان")
+            return False, f"Budget too low: {min_budget:,}"
+
+        self.log_success(f"✅ پروژه واجد شرایط ارسال است!")
+        return True, "Approved"
+
     def analyze_project(self, project_id: int):
         """تحلیل یک پروژه با Claude"""
         try:
@@ -300,11 +435,7 @@ class ContinuousKarlancer:
         return None
 
     def submit_proposal(self, project_id: int, analysis_file: Path):
-        """ارسال proposal"""
-        if not self.auto_submit:
-            self.log_info(f"ارسال خودکار غیرفعال است - پروژه {project_id} آماده ارسال دستی")
-            return False
-
+        """ارسال proposal - فرض: قبلا فیلتر شده"""
         try:
             self.log_info(f"📤 ارسال خودکار proposal برای پروژه {project_id}...")
 
@@ -385,7 +516,17 @@ class ContinuousKarlancer:
 
             if analysis_file:
                 # ۳. ارسال (اختیاری)
-                submitted = self.submit_proposal(project_id, analysis_file)
+                submitted, submit_reason = False, "Not submitted"
+                if self.auto_submit:
+                    # بررسی هوشمند قبل از ارسال
+                    should_submit, reason = self.should_submit_proposal(project, analysis_file)
+                    if should_submit:
+                        submitted = self.submit_proposal(project_id, analysis_file)
+                        submit_reason = "Submitted successfully" if submitted else "Submission failed"
+                    else:
+                        submit_reason = f"Rejected: {reason}"
+                else:
+                    submit_reason = "Auto-submit disabled"
 
                 # به‌روزرسانی tracking
                 self.tracking["projects"][str(project_id)] = {
@@ -393,6 +534,7 @@ class ContinuousKarlancer:
                     "fetched_at": datetime.now().isoformat(),
                     "analyzed": True,
                     "submitted": submitted,
+                    "submit_reason": submit_reason,
                     "analysis_file": str(analysis_file)
                 }
                 self.tracking["total_analyzed"] += 1
@@ -434,6 +576,8 @@ class ContinuousKarlancer:
         self.log_success("🚀 ربات مداوم کارلنسر شروع شد")
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
+        if self.auto_submit:
+            self.log_info(f"⭐ حداقل امتیاز: {'⭐' * self.min_stars} ({self.min_stars}/5)")
         print("=" * 80 + "\n")
 
         iteration = 0
@@ -472,6 +616,8 @@ def main():
                        help='فاصله زمانی بررسی (ثانیه) - پیش‌فرض: 300 (5 دقیقه)')
     parser.add_argument('--auto-submit', action='store_true',
                        help='ارسال خودکار proposal ها')
+    parser.add_argument('--min-stars', type=int, default=4, choices=[1, 2, 3, 4, 5],
+                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4')
     parser.add_argument('--once', action='store_true',
                        help='فقط یک بار اجرا شود (بدون loop)')
 
@@ -482,7 +628,8 @@ def main():
     bot = ContinuousKarlancer(
         bearer_token=BEARER_TOKEN,
         check_interval=args.interval,
-        auto_submit=args.auto_submit
+        auto_submit=args.auto_submit,
+        min_stars=args.min_stars
     )
 
     if args.once:
