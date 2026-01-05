@@ -13,6 +13,7 @@ import subprocess
 import requests
 from datetime import datetime
 from pathlib import Path
+from telegram_logger import TelegramLogger
 
 # تنظیم encoding
 if sys.stdout.encoding != 'utf-8':
@@ -29,7 +30,7 @@ os.environ['LC_ALL'] = 'C.UTF-8'
 class ContinuousKarlancer:
     """ربات مداوم کارلنسر"""
 
-    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4):
+    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4, strict_mode: bool = False, telegram_logger: TelegramLogger = None):
         """
         مقداردهی اولیه
 
@@ -38,11 +39,15 @@ class ContinuousKarlancer:
             check_interval: فاصله زمانی بررسی (ثانیه) - پیش‌فرض 5 دقیقه
             auto_submit: ارسال خودکار proposal (پیش‌فرض: False)
             min_stars: حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4
+            strict_mode: حالت سخت‌گیرانه برای whitelist (پیش‌فرض: False)
+            telegram_logger: logger تلگرام (اختیاری)
         """
         self.bearer_token = bearer_token
         self.check_interval = check_interval
         self.auto_submit = auto_submit
         self.min_stars = min_stars
+        self.strict_mode = strict_mode
+        self.tg = telegram_logger  # Telegram Logger
 
         # تکنولوژی‌ها و کلمات کلیدی که باید رد بشن
         self.tech_blacklist = [
@@ -248,22 +253,25 @@ class ContinuousKarlancer:
 
         combined_text = f"{title} {description} {' '.join(skills)}"
 
-        # بررسی blacklist
+        # بررسی blacklist - همیشه فعال
         for tech in self.tech_blacklist:
             if tech.lower() in combined_text:
                 self.log_warning(f"⚠️  تکنولوژی نامناسب پیدا شد: {tech}")
                 return False, f"Contains blacklisted tech: {tech}"
 
-        # بررسی whitelist - حداقل یکی باید باشه
-        found_match = False
-        for tech in self.tech_whitelist:
-            if tech.lower() in combined_text:
-                found_match = True
-                break
+        # بررسی whitelist - فقط در حالت strict
+        if self.strict_mode:
+            found_match = False
+            for tech in self.tech_whitelist:
+                if tech.lower() in combined_text:
+                    found_match = True
+                    break
 
-        if not found_match:
-            self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد")
-            return False, "No relevant technology found"
+            if not found_match:
+                self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد (strict mode)")
+                return False, "No relevant technology found (strict mode)"
+        else:
+            self.log_info(f"ℹ️  حالت عادی: whitelist غیرفعال - فقط blacklist چک میشه")
 
         return True, "Compatible"
 
@@ -276,8 +284,19 @@ class ContinuousKarlancer:
             # جستجوی الگوی ستاره‌ها
             import re
 
-            # پیدا کردن بخش توصیه
-            recommendation_section = re.search(r'(?:🎯|###)\s*توصیه.*?(?=(?:###|📝|💰|$))', content, re.DOTALL | re.IGNORECASE)
+            # الگوهای مختلف برای پیدا کردن بخش توصیه
+            patterns = [
+                r'(?:🎯|###|##)\s*توصیه.*?(?=(?:###|##|📝|💰|$))',
+                r'توصیه.*?(?=(?:###|##|📝|💰|$))',
+                r'recommendation.*?(?=(?:###|##|📝|💰|$))',
+            ]
+
+            recommendation_section = None
+            for pattern in patterns:
+                match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+                if match:
+                    recommendation_section = match
+                    break
 
             if recommendation_section:
                 section_text = recommendation_section.group(0)
@@ -285,11 +304,18 @@ class ContinuousKarlancer:
                 # شمارش ستاره‌ها
                 stars = section_text.count('⭐')
 
+                # اگر ستاره‌ای نبود، سعی کن از کل فایل بخونی
+                if stars == 0:
+                    stars = content.count('⭐')
+                    # محدود کن به max 5
+                    if stars > 10:  # اگر خیلی زیاد بود، احتمالا اشتباهه
+                        stars = 0
+
                 # جستجوی توصیه (Take/Skip/Negotiate)
                 decision = None
-                if re.search(r'\b(skip|رد کن|نزن)\b', section_text, re.IGNORECASE):
+                if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', section_text, re.IGNORECASE):
                     decision = "Skip"
-                elif re.search(r'\b(take|قبول کن|بزن)\b', section_text, re.IGNORECASE):
+                elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', section_text, re.IGNORECASE):
                     decision = "Take"
                 elif re.search(r'\b(negotiate|مذاکره)\b', section_text, re.IGNORECASE):
                     decision = "Negotiate"
@@ -297,7 +323,25 @@ class ContinuousKarlancer:
                 return {
                     'stars': stars,
                     'decision': decision,
-                    'section': section_text[:200]
+                    'section': section_text[:300]
+                }
+
+            # اگر بخش توصیه پیدا نشد، سعی کن کل فایل رو بررسی کنی
+            stars = content.count('⭐')
+            if stars > 10:
+                stars = 0  # احتمالا noise است
+
+            decision = None
+            if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', content, re.IGNORECASE):
+                decision = "Skip"
+            elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', content, re.IGNORECASE):
+                decision = "Take"
+
+            if stars > 0 or decision:
+                return {
+                    'stars': stars,
+                    'decision': decision,
+                    'section': 'Extracted from full content'
                 }
 
             return None
@@ -496,6 +540,10 @@ class ContinuousKarlancer:
 
         self.log_success(f"🆕 {len(new_projects)} پروژه جدید پیدا شد!")
 
+        # اطلاع به تلگرام
+        if self.tg:
+            self.tg.send_new_projects(len(new_projects))
+
         # پردازش هر پروژه
         for idx, project in enumerate(new_projects, 1):
             project_id = project['id']
@@ -520,11 +568,28 @@ class ContinuousKarlancer:
                 if self.auto_submit:
                     # بررسی هوشمند قبل از ارسال
                     should_submit, reason = self.should_submit_proposal(project, analysis_file)
+
+                    # اطلاع‌رسانی تلگرام برای تصمیم
+                    if self.tg:
+                        # استخراج امتیاز برای تلگرام
+                        recommendation = self.extract_recommendation_rating(analysis_file)
+                        stars = recommendation.get('stars', 0) if recommendation else 0
+                        decision = recommendation.get('decision') if recommendation else None
+                        self.tg.send_project_analyzed(project_id, title, stars, decision)
+
                     if should_submit:
                         submitted = self.submit_proposal(project_id, analysis_file)
                         submit_reason = "Submitted successfully" if submitted else "Submission failed"
+
+                        # اطلاع به تلگرام
+                        if submitted and self.tg:
+                            self.tg.send_project_submitted(project_id, title)
                     else:
                         submit_reason = f"Rejected: {reason}"
+
+                        # اطلاع به تلگرام
+                        if self.tg:
+                            self.tg.send_project_rejected(project_id, title, reason)
                 else:
                     submit_reason = "Auto-submit disabled"
 
@@ -576,9 +641,16 @@ class ContinuousKarlancer:
         self.log_success("🚀 ربات مداوم کارلنسر شروع شد")
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
+        self.log_info(f"🔒 حالت: {'سخت‌گیرانه (strict)' if self.strict_mode else 'عادی (normal)'}")
         if self.auto_submit:
             self.log_info(f"⭐ حداقل امتیاز: {'⭐' * self.min_stars} ({self.min_stars}/5)")
+        if self.tg:
+            self.log_info(f"📱 Telegram Logger: فعال")
         print("=" * 80 + "\n")
+
+        # اطلاع شروع به تلگرام
+        if self.tg:
+            self.tg.send_startup(self.check_interval, self.auto_submit, self.min_stars, self.strict_mode)
 
         iteration = 0
 
@@ -604,6 +676,16 @@ class ContinuousKarlancer:
             self.log_info(f"  - کل تحلیل‌ها: {self.tracking['total_analyzed']}")
             self.log_info(f"  - کل ارسال‌ها: {self.tracking['total_submitted']}")
             self.log_info(f"  - کل خطاها: {self.tracking['total_failed']}")
+
+            # اطلاع به تلگرام
+            if self.tg:
+                self.tg.send_shutdown(
+                    self.tracking['total_fetched'],
+                    self.tracking['total_analyzed'],
+                    self.tracking['total_submitted'],
+                    self.tracking['total_failed']
+                )
+
             self.log_success("👋 خداحافظ!")
 
 
@@ -616,20 +698,40 @@ def main():
                        help='فاصله زمانی بررسی (ثانیه) - پیش‌فرض: 300 (5 دقیقه)')
     parser.add_argument('--auto-submit', action='store_true',
                        help='ارسال خودکار proposal ها')
-    parser.add_argument('--min-stars', type=int, default=4, choices=[1, 2, 3, 4, 5],
-                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4')
+    parser.add_argument('--min-stars', type=int, default=3, choices=[1, 2, 3, 4, 5],
+                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 3')
+    parser.add_argument('--strict', action='store_true',
+                       help='حالت سخت‌گیرانه: whitelist فعال میشه و فقط پروژه‌های Python/Django/Bot قبول میشن')
+    parser.add_argument('--telegram-chat-id', type=str,
+                       help='Chat ID تلگرام برای دریافت لاگ‌ها')
     parser.add_argument('--once', action='store_true',
                        help='فقط یک بار اجرا شود (بدون loop)')
 
     args = parser.parse_args()
 
     BEARER_TOKEN = "2639199|WDj6UAvuCppotknYzIAvzaSBx1h9BPS151eVLgAwBL8HwQBeLGKXio5sSowHy97UrTdcIzViXQCUlX6ZA6SOy6JTGZmeuDME2dNESKGOUtBsqtpm5B3GeHCs6sJmhdxA2dUrmHQrcr7X24OcMOtfj7xpiO5sxoOiq0r9QfSMeDVsLtoXRus1rmbXlbMAmoTVzVlx5W7WHfdfpWElBtAVXuvWXWXomsMU1pMfTVhPaVZ1gkjC7NSUTpIi0SB16VfKtG7INfgosHBP8Z9ojB1g0cfQCdvRAjsxfbfwoW6zBI98D1xIKJn6mVas4jtFgBJRO5IXktQ0i77R0KANlIqlfZDPwMzklBCYR11U4SmDVrQ3diENQhCeV6F8Bcw2nQw6YB3sdJRXCRAktn6lg5cAGPL3h09RXo4KBGLYnNvgdMcTKQw9912ouaalBsE2jyJeogFI6J5uoL9MlSQfnvQlx2BFqePqAzF5vIDnJ8ck1kvpBxcJHZdkno8yhTHjrLfcU8HE0gI34pbr8NiGNR6WB5uBtXII"
+    TELEGRAM_BOT_TOKEN = "8479753307:AAEOOUbyv6Jun5fZKb73dpKEsMLL8xAUub4"
+
+    # Initialize Telegram Logger
+    telegram_logger = None
+    if args.telegram_chat_id:
+        telegram_logger = TelegramLogger(
+            bot_token=TELEGRAM_BOT_TOKEN,
+            chat_id=args.telegram_chat_id,
+            enabled=True
+        )
+        # تست اتصال
+        if not telegram_logger.test_connection():
+            print("⚠️  خطا در اتصال به بات تلگرام - ادامه بدون Telegram Logger")
+            telegram_logger = None
 
     bot = ContinuousKarlancer(
         bearer_token=BEARER_TOKEN,
         check_interval=args.interval,
         auto_submit=args.auto_submit,
-        min_stars=args.min_stars
+        min_stars=args.min_stars,
+        strict_mode=args.strict,
+        telegram_logger=telegram_logger
     )
 
     if args.once:
