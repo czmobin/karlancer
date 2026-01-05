@@ -712,18 +712,35 @@ def main():
     BEARER_TOKEN = "2639199|WDj6UAvuCppotknYzIAvzaSBx1h9BPS151eVLgAwBL8HwQBeLGKXio5sSowHy97UrTdcIzViXQCUlX6ZA6SOy6JTGZmeuDME2dNESKGOUtBsqtpm5B3GeHCs6sJmhdxA2dUrmHQrcr7X24OcMOtfj7xpiO5sxoOiq0r9QfSMeDVsLtoXRus1rmbXlbMAmoTVzVlx5W7WHfdfpWElBtAVXuvWXWXomsMU1pMfTVhPaVZ1gkjC7NSUTpIi0SB16VfKtG7INfgosHBP8Z9ojB1g0cfQCdvRAjsxfbfwoW6zBI98D1xIKJn6mVas4jtFgBJRO5IXktQ0i77R0KANlIqlfZDPwMzklBCYR11U4SmDVrQ3diENQhCeV6F8Bcw2nQw6YB3sdJRXCRAktn6lg5cAGPL3h09RXo4KBGLYnNvgdMcTKQw9912ouaalBsE2jyJeogFI6J5uoL9MlSQfnvQlx2BFqePqAzF5vIDnJ8ck1kvpBxcJHZdkno8yhTHjrLfcU8HE0gI34pbr8NiGNR6WB5uBtXII"
     TELEGRAM_BOT_TOKEN = "8479753307:AAEOOUbyv6Jun5fZKb73dpKEsMLL8xAUub4"
 
+    # خواندن Chat ID از فایل یا آرگومان
+    chat_id = args.telegram_chat_id
+
+    # اگر chat_id داده نشده، از فایل بخون
+    if not chat_id and Path('.telegram_chat_id').exists():
+        try:
+            with open('.telegram_chat_id', 'r') as f:
+                chat_id = f.read().strip()
+                print(f"📱 Chat ID از فایل خوانده شد: {chat_id}")
+        except Exception as e:
+            print(f"⚠️  خطا در خواندن .telegram_chat_id: {e}")
+
     # Initialize Telegram Logger
     telegram_logger = None
-    if args.telegram_chat_id:
+    if chat_id:
         telegram_logger = TelegramLogger(
             bot_token=TELEGRAM_BOT_TOKEN,
-            chat_id=args.telegram_chat_id,
+            chat_id=chat_id,
             enabled=True
         )
         # تست اتصال
+        print("🧪 تست اتصال به تلگرام...")
         if not telegram_logger.test_connection():
             print("⚠️  خطا در اتصال به بات تلگرام - ادامه بدون Telegram Logger")
             telegram_logger = None
+        else:
+            print("✅ Telegram Logger فعال شد!")
+    else:
+        print("ℹ️  Telegram Logger غیرفعال است (برای فعال‌سازی: python3 get_chat_id.py <bot_token>)")
 
     bot = ContinuousKarlancer(
         bearer_token=BEARER_TOKEN,
