@@ -29,7 +29,7 @@ os.environ['LC_ALL'] = 'C.UTF-8'
 class ContinuousKarlancer:
     """ربات مداوم کارلنسر"""
 
-    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4):
+    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4, strict_mode: bool = False):
         """
         مقداردهی اولیه
 
@@ -38,11 +38,13 @@ class ContinuousKarlancer:
             check_interval: فاصله زمانی بررسی (ثانیه) - پیش‌فرض 5 دقیقه
             auto_submit: ارسال خودکار proposal (پیش‌فرض: False)
             min_stars: حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4
+            strict_mode: حالت سخت‌گیرانه برای whitelist (پیش‌فرض: False)
         """
         self.bearer_token = bearer_token
         self.check_interval = check_interval
         self.auto_submit = auto_submit
         self.min_stars = min_stars
+        self.strict_mode = strict_mode
 
         # تکنولوژی‌ها و کلمات کلیدی که باید رد بشن
         self.tech_blacklist = [
@@ -248,22 +250,25 @@ class ContinuousKarlancer:
 
         combined_text = f"{title} {description} {' '.join(skills)}"
 
-        # بررسی blacklist
+        # بررسی blacklist - همیشه فعال
         for tech in self.tech_blacklist:
             if tech.lower() in combined_text:
                 self.log_warning(f"⚠️  تکنولوژی نامناسب پیدا شد: {tech}")
                 return False, f"Contains blacklisted tech: {tech}"
 
-        # بررسی whitelist - حداقل یکی باید باشه
-        found_match = False
-        for tech in self.tech_whitelist:
-            if tech.lower() in combined_text:
-                found_match = True
-                break
+        # بررسی whitelist - فقط در حالت strict
+        if self.strict_mode:
+            found_match = False
+            for tech in self.tech_whitelist:
+                if tech.lower() in combined_text:
+                    found_match = True
+                    break
 
-        if not found_match:
-            self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد")
-            return False, "No relevant technology found"
+            if not found_match:
+                self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد (strict mode)")
+                return False, "No relevant technology found (strict mode)"
+        else:
+            self.log_info(f"ℹ️  حالت عادی: whitelist غیرفعال - فقط blacklist چک میشه")
 
         return True, "Compatible"
 
@@ -276,8 +281,19 @@ class ContinuousKarlancer:
             # جستجوی الگوی ستاره‌ها
             import re
 
-            # پیدا کردن بخش توصیه
-            recommendation_section = re.search(r'(?:🎯|###)\s*توصیه.*?(?=(?:###|📝|💰|$))', content, re.DOTALL | re.IGNORECASE)
+            # الگوهای مختلف برای پیدا کردن بخش توصیه
+            patterns = [
+                r'(?:🎯|###|##)\s*توصیه.*?(?=(?:###|##|📝|💰|$))',
+                r'توصیه.*?(?=(?:###|##|📝|💰|$))',
+                r'recommendation.*?(?=(?:###|##|📝|💰|$))',
+            ]
+
+            recommendation_section = None
+            for pattern in patterns:
+                match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+                if match:
+                    recommendation_section = match
+                    break
 
             if recommendation_section:
                 section_text = recommendation_section.group(0)
@@ -285,11 +301,18 @@ class ContinuousKarlancer:
                 # شمارش ستاره‌ها
                 stars = section_text.count('⭐')
 
+                # اگر ستاره‌ای نبود، سعی کن از کل فایل بخونی
+                if stars == 0:
+                    stars = content.count('⭐')
+                    # محدود کن به max 5
+                    if stars > 10:  # اگر خیلی زیاد بود، احتمالا اشتباهه
+                        stars = 0
+
                 # جستجوی توصیه (Take/Skip/Negotiate)
                 decision = None
-                if re.search(r'\b(skip|رد کن|نزن)\b', section_text, re.IGNORECASE):
+                if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', section_text, re.IGNORECASE):
                     decision = "Skip"
-                elif re.search(r'\b(take|قبول کن|بزن)\b', section_text, re.IGNORECASE):
+                elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', section_text, re.IGNORECASE):
                     decision = "Take"
                 elif re.search(r'\b(negotiate|مذاکره)\b', section_text, re.IGNORECASE):
                     decision = "Negotiate"
@@ -297,7 +320,25 @@ class ContinuousKarlancer:
                 return {
                     'stars': stars,
                     'decision': decision,
-                    'section': section_text[:200]
+                    'section': section_text[:300]
+                }
+
+            # اگر بخش توصیه پیدا نشد، سعی کن کل فایل رو بررسی کنی
+            stars = content.count('⭐')
+            if stars > 10:
+                stars = 0  # احتمالا noise است
+
+            decision = None
+            if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', content, re.IGNORECASE):
+                decision = "Skip"
+            elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', content, re.IGNORECASE):
+                decision = "Take"
+
+            if stars > 0 or decision:
+                return {
+                    'stars': stars,
+                    'decision': decision,
+                    'section': 'Extracted from full content'
                 }
 
             return None
@@ -576,6 +617,7 @@ class ContinuousKarlancer:
         self.log_success("🚀 ربات مداوم کارلنسر شروع شد")
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
+        self.log_info(f"🔒 حالت: {'سخت‌گیرانه (strict)' if self.strict_mode else 'عادی (normal)'}")
         if self.auto_submit:
             self.log_info(f"⭐ حداقل امتیاز: {'⭐' * self.min_stars} ({self.min_stars}/5)")
         print("=" * 80 + "\n")
@@ -616,8 +658,10 @@ def main():
                        help='فاصله زمانی بررسی (ثانیه) - پیش‌فرض: 300 (5 دقیقه)')
     parser.add_argument('--auto-submit', action='store_true',
                        help='ارسال خودکار proposal ها')
-    parser.add_argument('--min-stars', type=int, default=4, choices=[1, 2, 3, 4, 5],
-                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4')
+    parser.add_argument('--min-stars', type=int, default=3, choices=[1, 2, 3, 4, 5],
+                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 3')
+    parser.add_argument('--strict', action='store_true',
+                       help='حالت سخت‌گیرانه: whitelist فعال میشه و فقط پروژه‌های Python/Django/Bot قبول میشن')
     parser.add_argument('--once', action='store_true',
                        help='فقط یک بار اجرا شود (بدون loop)')
 
@@ -629,7 +673,8 @@ def main():
         bearer_token=BEARER_TOKEN,
         check_interval=args.interval,
         auto_submit=args.auto_submit,
-        min_stars=args.min_stars
+        min_stars=args.min_stars,
+        strict_mode=args.strict
     )
 
     if args.once:
