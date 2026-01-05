@@ -276,72 +276,55 @@ class ContinuousKarlancer:
         return True, "Compatible"
 
     def extract_recommendation_rating(self, analysis_file: Path):
-        """استخراج امتیاز توصیه از فایل تحلیل"""
+        """استخراج امتیاز توصیه از فایل تحلیل - نسخه بهبود یافته"""
         try:
             with open(analysis_file, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            # جستجوی الگوی ستاره‌ها
             import re
 
-            # الگوهای مختلف برای پیدا کردن بخش توصیه
-            patterns = [
-                r'(?:🎯|###|##)\s*توصیه.*?(?=(?:###|##|📝|💰|$))',
-                r'توصیه.*?(?=(?:###|##|📝|💰|$))',
-                r'recommendation.*?(?=(?:###|##|📝|💰|$))',
-            ]
+            # روش 1: جستجوی emoji ستاره ⭐
+            stars_emoji = content.count('⭐')
+            if 0 < stars_emoji <= 5:
+                stars = stars_emoji
+            # روش 2: جستجوی unicode star ★
+            elif content.count('★') <= 5:
+                stars = content.count('★')
+            # روش 3: جستجوی الگوی "X/5" یا "X از 5"
+            elif re.search(r'(\d)\s*/\s*5', content):
+                match = re.search(r'(\d)\s*/\s*5', content)
+                stars = int(match.group(1))
+            # روش 4: جستجوی "X ستاره" یا "X star"
+            elif re.search(r'(\d)\s*(?:ستاره|star)', content, re.IGNORECASE):
+                match = re.search(r'(\d)\s*(?:ستاره|star)', content, re.IGNORECASE)
+                stars = int(match.group(1))
+            # روش 5: الگوهای priority
+            elif re.search(r'must.*take|priority.*5', content, re.IGNORECASE):
+                stars = 5
+            elif re.search(r'should.*take|priority.*4', content, re.IGNORECASE):
+                stars = 4
+            elif re.search(r'consider|priority.*3', content, re.IGNORECASE):
+                stars = 3
+            elif re.search(r'skip.*unless|priority.*2', content, re.IGNORECASE):
+                stars = 2
+            else:
+                stars = 0
 
-            recommendation_section = None
-            for pattern in patterns:
-                match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
-                if match:
-                    recommendation_section = match
-                    break
-
-            if recommendation_section:
-                section_text = recommendation_section.group(0)
-
-                # شمارش ستاره‌ها
-                stars = section_text.count('⭐')
-
-                # اگر ستاره‌ای نبود، سعی کن از کل فایل بخونی
-                if stars == 0:
-                    stars = content.count('⭐')
-                    # محدود کن به max 5
-                    if stars > 10:  # اگر خیلی زیاد بود، احتمالا اشتباهه
-                        stars = 0
-
-                # جستجوی توصیه (Take/Skip/Negotiate)
-                decision = None
-                if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', section_text, re.IGNORECASE):
-                    decision = "Skip"
-                elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', section_text, re.IGNORECASE):
-                    decision = "Take"
-                elif re.search(r'\b(negotiate|مذاکره)\b', section_text, re.IGNORECASE):
-                    decision = "Negotiate"
-
-                return {
-                    'stars': stars,
-                    'decision': decision,
-                    'section': section_text[:300]
-                }
-
-            # اگر بخش توصیه پیدا نشد، سعی کن کل فایل رو بررسی کنی
-            stars = content.count('⭐')
-            if stars > 10:
-                stars = 0  # احتمالا noise است
-
+            # جستجوی decision
             decision = None
-            if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', content, re.IGNORECASE):
+            if re.search(r'\b(skip|رد\s*کن|نزن|reject|نمیره)\b', content, re.IGNORECASE):
                 decision = "Skip"
-            elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', content, re.IGNORECASE):
+            elif re.search(r'\b(take|قبول\s*کن|بزن|accept|بگیر)\b', content, re.IGNORECASE):
                 decision = "Take"
+            elif re.search(r'\b(negotiate|مذاکره)\b', content, re.IGNORECASE):
+                decision = "Negotiate"
 
+            # اگه امتیاز یا تصمیم پیدا شد
             if stars > 0 or decision:
                 return {
                     'stars': stars,
                     'decision': decision,
-                    'section': 'Extracted from full content'
+                    'section': f'Stars: {stars}, Decision: {decision}'
                 }
 
             return None
