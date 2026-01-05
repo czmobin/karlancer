@@ -48,3 +48,6 @@ bot.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Telegram configuration
+.telegram_chat_id
