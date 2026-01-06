@@ -48,6 +48,8 @@ class ProposalSubmitter:
         """دریافت اطلاعات پروژه از API"""
         try:
             url = f"{self.project_api_url}/{project_id}"
+            print(f"🔍 دریافت اطلاعات پروژه {project_id} از API...")
+
             response = requests.get(
                 url,
                 headers=self.headers,
@@ -55,17 +57,39 @@ class ProposalSubmitter:
                 timeout=10
             )
 
+            print(f"📊 API Response Status: {response.status_code}")
+
             if response.status_code == 200:
                 data = response.json()
+                print(f"📦 API Response: {json.dumps(data, ensure_ascii=False)[:200]}...")
+
                 if data.get("status") == "success":
                     project = data.get("data")
-                    return {
-                        'min_budget': project.get('min_budget', 0),
-                        'max_budget': project.get('max_budget', 0),
-                        'job_duration': project.get('job_duration', 1)
-                    }
+                    if project:
+                        min_budget = project.get('min_budget', 0)
+                        max_budget = project.get('max_budget', 0)
+                        job_duration = project.get('job_duration', 1)
+
+                        print(f"✅ بودجه از API: {min_budget:,} - {max_budget:,} تومان")
+                        print(f"✅ مدت زمان: {job_duration} روز")
+
+                        return {
+                            'min_budget': min_budget,
+                            'max_budget': max_budget,
+                            'job_duration': job_duration
+                        }
+                    else:
+                        print("⚠️  فیلد 'data' خالی است")
+                else:
+                    print(f"⚠️  وضعیت API: {data.get('status')}")
+            else:
+                print(f"❌ خطای HTTP: {response.status_code}")
+                print(f"Response: {response.text[:200]}")
+
         except Exception as e:
-            print(f"⚠️  خطا در دریافت اطلاعات پروژه از API: {e}")
+            print(f"❌ خطا در دریافت اطلاعات پروژه از API: {e}")
+            import traceback
+            traceback.print_exc()
 
         return None
 
@@ -109,24 +133,32 @@ class ProposalSubmitter:
         # روش 1: دریافت از API
         project_info = self.get_project_info(project_id)
 
-        # روش 2: استخراج از فایل تحلیل
-        if not project_info and analysis_file:
-            project_info = self.extract_budget_from_analysis(analysis_file)
+        # بررسی اینکه بودجه معتبر باشه
+        if project_info and project_info.get('min_budget', 0) > 0:
+            budget = project_info['min_budget']
+            duration = project_info.get('job_duration', 7)
+            print(f"✅ استفاده از بودجه API: {budget:,} تومان")
+        else:
+            # روش 2: استخراج از فایل تحلیل
+            if analysis_file:
+                print("⚠️  API موفق نبود، تلاش برای استخراج از فایل تحلیل...")
+                file_info = self.extract_budget_from_analysis(analysis_file)
+                if file_info and file_info.get('min_budget', 0) > 0:
+                    budget = file_info['min_budget']
+                    duration = file_info.get('job_duration', 7)
+                    print(f"✅ استفاده از بودجه فایل: {budget:,} تومان")
+                else:
+                    # روش 3: مقادیر پیش‌فرض - بودجه بالاتر برای جلوگیری از خطا
+                    budget = 5000000  # افزایش به 5M برای جلوگیری از خطای validation
+                    duration = 7
+                    print(f"⚠️  استفاده از بودجه پیش‌فرض: {budget:,} تومان")
+            else:
+                # روش 3: مقادیر پیش‌فرض
+                budget = 5000000
+                duration = 7
+                print(f"⚠️  استفاده از بودجه پیش‌فرض: {budget:,} تومان")
 
-        # روش 3: مقادیر پیش‌فرض
-        if not project_info:
-            print("⚠️  استفاده از بودجه پیش‌فرض")
-            project_info = {
-                'min_budget': 2500000,  # افزایش از 1M به 2.5M
-                'max_budget': 5000000,
-                'job_duration': 7
-            }
-
-        # استفاده از حداقل بودجه برای milestone
-        budget = project_info['min_budget']
-        duration = project_info.get('job_duration', 7)
-
-        print(f"💰 بودجه milestone: {budget:,} تومان")
+        print(f"💰 بودجه نهایی milestone: {budget:,} تومان")
         print(f"⏱️  مدت زمان: {duration} روز")
 
         return [
@@ -162,6 +194,10 @@ class ProposalSubmitter:
         }
 
         try:
+            print(f"📤 ارسال proposal به API...")
+            print(f"📋 Project ID: {project_id}")
+            print(f"💰 Budget: {milestones[0]['budget']} تومان")
+
             response = requests.post(
                 self.api_url,
                 headers=self.headers,
@@ -170,18 +206,35 @@ class ProposalSubmitter:
                 timeout=10
             )
 
+            print(f"📊 Submit Response Status: {response.status_code}")
+
             if response.status_code in [200, 201]:
+                result_data = response.json()
+                print(f"✅ موفق: {json.dumps(result_data, ensure_ascii=False)[:200]}")
                 return {
                     'success': True,
-                    'data': response.json()
+                    'data': result_data
                 }
             else:
+                error_text = response.text
+                print(f"❌ خطا: {error_text}")
+
+                # تلاش برای parse کردن JSON error
+                try:
+                    error_json = response.json()
+                    error_msg = error_json.get('message', error_text)
+                except:
+                    error_msg = error_text
+
                 return {
                     'success': False,
-                    'error': f"HTTP {response.status_code}: {response.text}"
+                    'error': f"HTTP {response.status_code}: {error_msg}"
                 }
 
         except Exception as e:
+            print(f"❌ Exception در submit: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 'success': False,
                 'error': str(e)

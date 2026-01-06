@@ -385,6 +385,27 @@ class ContinuousKarlancer:
                 proposal = proposal.replace('سلام', 'SALAM')
                 proposal = proposal.replace('سلام،', 'SALAM،')
 
+            # استخراج بودجه از project
+            min_budget = project.get('min_budget', 0)
+            max_budget = project.get('max_budget', 0)
+            job_duration = project.get('job_duration', 7)
+
+            self.log_info(f"💰 بودجه پروژه: {min_budget:,} - {max_budget:,} تومان")
+            self.log_info(f"⏱️  مدت زمان: {job_duration} روز")
+
+            # افزودن بودجه به فایل تحلیل برای استفاده در submitter
+            # اضافه کردن به اول فایل
+            budget_header = f"""min_budget: {min_budget}
+max_budget: {max_budget}
+job_duration: {job_duration}
+---
+"""
+            # ذخیره موقت با budget info
+            temp_analysis = analysis_file.parent / f"{analysis_file.stem}_with_budget{analysis_file.suffix}"
+            with open(temp_analysis, 'w', encoding='utf-8') as f:
+                with open(analysis_file, 'r', encoding='utf-8') as orig:
+                    f.write(budget_header + orig.read())
+
             # ارسال
             import sys
             sys.path.insert(0, str(Path(__file__).parent))
@@ -394,8 +415,12 @@ class ContinuousKarlancer:
             result = submitter.submit_proposal(
                 project_id=project_id,
                 description=proposal,
-                analysis_file=str(analysis_file)
+                analysis_file=str(temp_analysis)  # استفاده از فایل با budget info
             )
+
+            # حذف فایل موقت
+            if temp_analysis.exists():
+                temp_analysis.unlink()
 
             if result['success']:
                 self.log_success(f"✅ پروژه {project_id} با موفقیت ارسال شد!")
