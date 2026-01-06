@@ -334,7 +334,7 @@ class ContinuousKarlancer:
             return None
 
     def should_submit_proposal(self, project: dict, analysis_file: Path):
-        """تصمیم‌گیری هوشمند برای ارسال پروپوزال"""
+        """تصمیم‌گیری ساده برای ارسال پروپوزال - فقط بر اساس تکنولوژی و بودجه"""
 
         # ۱. بررسی سازگاری تکنولوژی
         is_compatible, tech_reason = self.check_tech_compatibility(project)
@@ -343,35 +343,14 @@ class ContinuousKarlancer:
             self.log_warning(f"❌ پروژه {project.get('id')} رد شد: {tech_reason}")
             return False, tech_reason
 
-        # ۲. استخراج امتیاز توصیه Claude
-        recommendation = self.extract_recommendation_rating(analysis_file)
-
-        if not recommendation:
-            self.log_warning(f"⚠️  نمی‌توان امتیاز توصیه را پیدا کرد - رد می‌شود")
-            return False, "Could not extract recommendation"
-
-        stars = recommendation.get('stars', 0)
-        decision = recommendation.get('decision', '')
-
-        self.log_info(f"📊 امتیاز توصیه: {'⭐' * stars} ({stars}/5) - تصمیم: {decision}")
-
-        # ۳. بررسی امتیاز ستاره
-        if stars < self.min_stars:
-            self.log_warning(f"❌ امتیاز کم ({stars} < {self.min_stars}) - رد می‌شود")
-            return False, f"Rating too low: {stars} stars"
-
-        # ۴. بررسی تصمیم صریح
-        if decision == "Skip":
-            self.log_warning(f"❌ Claude توصیه کرده این پروژه رو رد کنی")
-            return False, "Claude recommended to skip"
-
-        # ۵. بررسی بودجه
+        # ۲. بررسی بودجه
         min_budget = project.get('min_budget', 0)
         if min_budget < 1_500_000:  # کمتر از 1.5 میلیون
             self.log_warning(f"❌ بودجه خیلی کم: {min_budget:,} تومان")
             return False, f"Budget too low: {min_budget:,}"
 
-        self.log_success(f"✅ پروژه واجد شرایط ارسال است!")
+        # ✅ همه چیز OK - ارسال بشه!
+        self.log_success(f"✅ پروژه واجد شرایط ارسال است! (بودجه: {min_budget:,} تومان)")
         return True, "Approved"
 
     def analyze_project(self, project_id: int):
@@ -549,16 +528,8 @@ class ContinuousKarlancer:
                 # ۳. ارسال (اختیاری)
                 submitted, submit_reason = False, "Not submitted"
                 if self.auto_submit:
-                    # بررسی هوشمند قبل از ارسال
+                    # بررسی ساده قبل از ارسال (فقط تکنولوژی و بودجه)
                     should_submit, reason = self.should_submit_proposal(project, analysis_file)
-
-                    # اطلاع‌رسانی تلگرام برای تصمیم
-                    if self.tg:
-                        # استخراج امتیاز برای تلگرام
-                        recommendation = self.extract_recommendation_rating(analysis_file)
-                        stars = recommendation.get('stars', 0) if recommendation else 0
-                        decision = recommendation.get('decision') if recommendation else None
-                        self.tg.send_project_analyzed(project_id, title, stars, decision)
 
                     if should_submit:
                         submitted = self.submit_proposal(project_id, analysis_file)
@@ -625,15 +596,14 @@ class ContinuousKarlancer:
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
         self.log_info(f"🔒 حالت: {'سخت‌گیرانه (strict)' if self.strict_mode else 'عادی (normal)'}")
-        if self.auto_submit:
-            self.log_info(f"⭐ حداقل امتیاز: {'⭐' * self.min_stars} ({self.min_stars}/5)")
+        self.log_info(f"🎯 فیلتر: فقط بر اساس تکنولوژی (blacklist) و بودجه (>1.5M)")
         if self.tg:
             self.log_info(f"📱 Telegram Logger: فعال")
         print("=" * 80 + "\n")
 
         # اطلاع شروع به تلگرام
         if self.tg:
-            self.tg.send_startup(self.check_interval, self.auto_submit, self.min_stars, self.strict_mode)
+            self.tg.send_startup(self.check_interval, self.auto_submit, 0, self.strict_mode)
 
         iteration = 0
 
@@ -676,13 +646,11 @@ def main():
     """تابع اصلی"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='ربات مداوم کارلنسر')
+    parser = argparse.ArgumentParser(description='ربات مداوم کارلنسر - ارسال خودکار بدون rating')
     parser.add_argument('--interval', type=int, default=300,
                        help='فاصله زمانی بررسی (ثانیه) - پیش‌فرض: 300 (5 دقیقه)')
     parser.add_argument('--auto-submit', action='store_true',
-                       help='ارسال خودکار proposal ها')
-    parser.add_argument('--min-stars', type=int, default=3, choices=[1, 2, 3, 4, 5],
-                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 3')
+                       help='ارسال خودکار proposal ها (بر اساس تکنولوژی و بودجه)')
     parser.add_argument('--strict', action='store_true',
                        help='حالت سخت‌گیرانه: whitelist فعال میشه و فقط پروژه‌های Python/Django/Bot قبول میشن')
     parser.add_argument('--telegram-chat-id', type=str,
@@ -729,7 +697,7 @@ def main():
         bearer_token=BEARER_TOKEN,
         check_interval=args.interval,
         auto_submit=args.auto_submit,
-        min_stars=args.min_stars,
+        min_stars=0,  # دیگه استفاده نمیشه - فقط برای سازگاری
         strict_mode=args.strict,
         telegram_logger=telegram_logger
     )
