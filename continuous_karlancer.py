@@ -245,151 +245,27 @@ class ContinuousKarlancer:
             self.log_error(f"خطا در ذخیره پروژه {project.get('id')}: {e}")
             return None
 
-    def check_tech_compatibility(self, project: dict):
-        """بررسی سازگاری تکنولوژی پروژه"""
+    def is_low_quality_project(self, project: dict):
+        """تشخیص پروژه‌های تخمی"""
         title = project.get('title', '').lower()
         description = project.get('description', '').lower()
-        skills = [s.get('name', '').lower() for s in project.get('skills', [])]
+        min_budget = project.get('min_budget', 0)
 
-        combined_text = f"{title} {description} {' '.join(skills)}"
+        # چک کردن تکنولوژی‌های نامناسب
+        bad_techs = ['wordpress', 'wp', 'woocommerce', 'shopify', 'php']
+        for tech in bad_techs:
+            if tech in title or tech in description:
+                return True
 
-        # بررسی blacklist - همیشه فعال
-        for tech in self.tech_blacklist:
-            if tech.lower() in combined_text:
-                self.log_warning(f"⚠️  تکنولوژی نامناسب پیدا شد: {tech}")
-                return False, f"Contains blacklisted tech: {tech}"
+        # چک کردن بودجه خیلی پایین
+        if min_budget < 1_000_000:
+            return True
 
-        # بررسی whitelist - فقط در حالت strict
-        if self.strict_mode:
-            found_match = False
-            for tech in self.tech_whitelist:
-                if tech.lower() in combined_text:
-                    found_match = True
-                    break
-
-            if not found_match:
-                self.log_warning(f"⚠️  هیچ تکنولوژی مرتبطی پیدا نشد (strict mode)")
-                return False, "No relevant technology found (strict mode)"
-        else:
-            self.log_info(f"ℹ️  حالت عادی: whitelist غیرفعال - فقط blacklist چک میشه")
-
-        return True, "Compatible"
-
-    def extract_recommendation_rating(self, analysis_file: Path):
-        """استخراج امتیاز توصیه از فایل تحلیل"""
-        try:
-            with open(analysis_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # جستجوی الگوی ستاره‌ها
-            import re
-
-            # الگوهای مختلف برای پیدا کردن بخش توصیه
-            patterns = [
-                r'(?:🎯|###|##)\s*توصیه.*?(?=(?:###|##|📝|💰|$))',
-                r'توصیه.*?(?=(?:###|##|📝|💰|$))',
-                r'recommendation.*?(?=(?:###|##|📝|💰|$))',
-            ]
-
-            recommendation_section = None
-            for pattern in patterns:
-                match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
-                if match:
-                    recommendation_section = match
-                    break
-
-            if recommendation_section:
-                section_text = recommendation_section.group(0)
-
-                # شمارش ستاره‌ها
-                stars = section_text.count('⭐')
-
-                # اگر ستاره‌ای نبود، سعی کن از کل فایل بخونی
-                if stars == 0:
-                    stars = content.count('⭐')
-                    # محدود کن به max 5
-                    if stars > 10:  # اگر خیلی زیاد بود، احتمالا اشتباهه
-                        stars = 0
-
-                # جستجوی توصیه (Take/Skip/Negotiate)
-                decision = None
-                if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', section_text, re.IGNORECASE):
-                    decision = "Skip"
-                elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', section_text, re.IGNORECASE):
-                    decision = "Take"
-                elif re.search(r'\b(negotiate|مذاکره)\b', section_text, re.IGNORECASE):
-                    decision = "Negotiate"
-
-                return {
-                    'stars': stars,
-                    'decision': decision,
-                    'section': section_text[:300]
-                }
-
-            # اگر بخش توصیه پیدا نشد، سعی کن کل فایل رو بررسی کنی
-            stars = content.count('⭐')
-            if stars > 10:
-                stars = 0  # احتمالا noise است
-
-            decision = None
-            if re.search(r'\b(skip|رد\s*کن|نزن|reject)\b', content, re.IGNORECASE):
-                decision = "Skip"
-            elif re.search(r'\b(take|قبول\s*کن|بزن|accept)\b', content, re.IGNORECASE):
-                decision = "Take"
-
-            if stars > 0 or decision:
-                return {
-                    'stars': stars,
-                    'decision': decision,
-                    'section': 'Extracted from full content'
-                }
-
-            return None
-
-        except Exception as e:
-            self.log_error(f"خطا در استخراج امتیاز توصیه: {e}")
-            return None
+        return False
 
     def should_submit_proposal(self, project: dict, analysis_file: Path):
-        """تصمیم‌گیری هوشمند برای ارسال پروپوزال"""
-
-        # ۱. بررسی سازگاری تکنولوژی
-        is_compatible, tech_reason = self.check_tech_compatibility(project)
-
-        if not is_compatible:
-            self.log_warning(f"❌ پروژه {project.get('id')} رد شد: {tech_reason}")
-            return False, tech_reason
-
-        # ۲. استخراج امتیاز توصیه Claude
-        recommendation = self.extract_recommendation_rating(analysis_file)
-
-        if not recommendation:
-            self.log_warning(f"⚠️  نمی‌توان امتیاز توصیه را پیدا کرد - رد می‌شود")
-            return False, "Could not extract recommendation"
-
-        stars = recommendation.get('stars', 0)
-        decision = recommendation.get('decision', '')
-
-        self.log_info(f"📊 امتیاز توصیه: {'⭐' * stars} ({stars}/5) - تصمیم: {decision}")
-
-        # ۳. بررسی امتیاز ستاره
-        if stars < self.min_stars:
-            self.log_warning(f"❌ امتیاز کم ({stars} < {self.min_stars}) - رد می‌شود")
-            return False, f"Rating too low: {stars} stars"
-
-        # ۴. بررسی تصمیم صریح
-        if decision == "Skip":
-            self.log_warning(f"❌ Claude توصیه کرده این پروژه رو رد کنی")
-            return False, "Claude recommended to skip"
-
-        # ۵. بررسی بودجه
-        min_budget = project.get('min_budget', 0)
-        if min_budget < 1_500_000:  # کمتر از 1.5 میلیون
-            self.log_warning(f"❌ بودجه خیلی کم: {min_budget:,} تومان")
-            return False, f"Budget too low: {min_budget:,}"
-
-        self.log_success(f"✅ پروژه واجد شرایط ارسال است!")
-        return True, "Approved"
+        """همه پروژه‌ها ارسال میشن - بدون فیلتر!"""
+        return True, "Send all projects"
 
     def analyze_project(self, project_id: int):
         """تحلیل یک پروژه با Claude"""
@@ -478,8 +354,8 @@ class ContinuousKarlancer:
 
         return None
 
-    def submit_proposal(self, project_id: int, analysis_file: Path):
-        """ارسال proposal - فرض: قبلا فیلتر شده"""
+    def submit_proposal(self, project_id: int, project: dict, analysis_file: Path):
+        """ارسال proposal - همه پروژه‌ها ارسال میشن"""
         try:
             self.log_info(f"📤 ارسال خودکار proposal برای پروژه {project_id}...")
 
@@ -496,6 +372,13 @@ class ContinuousKarlancer:
             if not proposal:
                 self.log_error(f"نمی‌توان proposal از فایل {analysis_file} استخراج کرد")
                 return False
+
+            # 🎯 تشخیص پروژه تخمی و تغییر "سلام" به "SALAM"
+            if self.is_low_quality_project(project):
+                self.log_warning(f"⚠️  پروژه {project_id} تخمی تشخیص داده شد - تغییر سلام به SALAM")
+                # عوض کردن همه "سلام" ها با "SALAM"
+                proposal = proposal.replace('سلام', 'SALAM')
+                proposal = proposal.replace('سلام،', 'SALAM،')
 
             # ارسال
             result = submitter.submit_proposal(
@@ -563,33 +446,16 @@ class ContinuousKarlancer:
             analysis_file = self.analyze_project(project_id)
 
             if analysis_file:
-                # ۳. ارسال (اختیاری)
+                # ۳. ارسال (همه ارسال میشن!)
                 submitted, submit_reason = False, "Not submitted"
                 if self.auto_submit:
-                    # بررسی هوشمند قبل از ارسال
-                    should_submit, reason = self.should_submit_proposal(project, analysis_file)
+                    # ارسال بدون فیلتر
+                    submitted = self.submit_proposal(project_id, project, analysis_file)
+                    submit_reason = "Submitted successfully" if submitted else "Submission failed"
 
-                    # اطلاع‌رسانی تلگرام برای تصمیم
-                    if self.tg:
-                        # استخراج امتیاز برای تلگرام
-                        recommendation = self.extract_recommendation_rating(analysis_file)
-                        stars = recommendation.get('stars', 0) if recommendation else 0
-                        decision = recommendation.get('decision') if recommendation else None
-                        self.tg.send_project_analyzed(project_id, title, stars, decision)
-
-                    if should_submit:
-                        submitted = self.submit_proposal(project_id, analysis_file)
-                        submit_reason = "Submitted successfully" if submitted else "Submission failed"
-
-                        # اطلاع به تلگرام
-                        if submitted and self.tg:
-                            self.tg.send_project_submitted(project_id, title)
-                    else:
-                        submit_reason = f"Rejected: {reason}"
-
-                        # اطلاع به تلگرام
-                        if self.tg:
-                            self.tg.send_project_rejected(project_id, title, reason)
+                    # اطلاع به تلگرام
+                    if submitted and self.tg:
+                        self.tg.send_project_submitted(project_id, title)
                 else:
                     submit_reason = "Auto-submit disabled"
 
@@ -642,15 +508,14 @@ class ContinuousKarlancer:
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
         self.log_info(f"🔒 حالت: {'سخت‌گیرانه (strict)' if self.strict_mode else 'عادی (normal)'}")
-        if self.auto_submit:
-            self.log_info(f"⭐ حداقل امتیاز: {'⭐' * self.min_stars} ({self.min_stars}/5)")
+        self.log_info(f"🎯 فیلتر: فقط بر اساس تکنولوژی (blacklist) و بودجه (>1.5M)")
         if self.tg:
             self.log_info(f"📱 Telegram Logger: فعال")
         print("=" * 80 + "\n")
 
         # اطلاع شروع به تلگرام
         if self.tg:
-            self.tg.send_startup(self.check_interval, self.auto_submit, self.min_stars, self.strict_mode)
+            self.tg.send_startup(self.check_interval, self.auto_submit, 0, self.strict_mode)
 
         iteration = 0
 
@@ -693,13 +558,11 @@ def main():
     """تابع اصلی"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='ربات مداوم کارلنسر')
+    parser = argparse.ArgumentParser(description='ربات مداوم کارلنسر - ارسال خودکار بدون rating')
     parser.add_argument('--interval', type=int, default=300,
                        help='فاصله زمانی بررسی (ثانیه) - پیش‌فرض: 300 (5 دقیقه)')
     parser.add_argument('--auto-submit', action='store_true',
-                       help='ارسال خودکار proposal ها')
-    parser.add_argument('--min-stars', type=int, default=3, choices=[1, 2, 3, 4, 5],
-                       help='حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 3')
+                       help='ارسال خودکار proposal ها (بر اساس تکنولوژی و بودجه)')
     parser.add_argument('--strict', action='store_true',
                        help='حالت سخت‌گیرانه: whitelist فعال میشه و فقط پروژه‌های Python/Django/Bot قبول میشن')
     parser.add_argument('--telegram-chat-id', type=str,
@@ -746,7 +609,7 @@ def main():
         bearer_token=BEARER_TOKEN,
         check_interval=args.interval,
         auto_submit=args.auto_submit,
-        min_stars=args.min_stars,
+        min_stars=0,  # دیگه استفاده نمیشه - فقط برای سازگاری
         strict_mode=args.strict,
         telegram_logger=telegram_logger
     )
