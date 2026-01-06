@@ -355,32 +355,42 @@ class ContinuousKarlancer:
         return None
 
     def submit_proposal(self, project_id: int, project: dict, analysis_file: Path):
-        """ارسال proposal - همه پروژه‌ها ارسال میشن"""
+        """ارسال proposal - کل محتوای Claude رو میفرسته"""
         try:
             self.log_info(f"📤 ارسال خودکار proposal برای پروژه {project_id}...")
 
-            # Import ProposalSubmitter
+            # خواندن کل فایل تحلیل
+            with open(analysis_file, 'r', encoding='utf-8') as f:
+                full_content = f.read()
+
+            # حذف header (خطوط اول که Project ID و تاریخ هستن)
+            lines = full_content.split('\n')
+            clean_lines = []
+
+            for i, line in enumerate(lines):
+                # Skip first 3 lines (Project ID, date, ===)
+                if i < 3:
+                    continue
+                clean_lines.append(line)
+
+            proposal = '\n'.join(clean_lines).strip()
+
+            if not proposal or len(proposal) < 50:
+                self.log_error(f"محتوای تحلیل خیلی کوتاه است: {len(proposal)} chars")
+                return False
+
+            # 🎯 تشخیص پروژه تخمی و تغییر "سلام" به "SALAM"
+            if self.is_low_quality_project(project):
+                self.log_warning(f"⚠️  پروژه {project_id} تخمی - تغییر سلام به SALAM")
+                proposal = proposal.replace('سلام', 'SALAM')
+                proposal = proposal.replace('سلام،', 'SALAM،')
+
+            # ارسال
             import sys
             sys.path.insert(0, str(Path(__file__).parent))
             from submit_proposal import ProposalSubmitter
 
             submitter = ProposalSubmitter(self.bearer_token)
-
-            # استخراج proposal
-            proposal = submitter.extract_proposal_from_analysis(str(analysis_file))
-
-            if not proposal:
-                self.log_error(f"نمی‌توان proposal از فایل {analysis_file} استخراج کرد")
-                return False
-
-            # 🎯 تشخیص پروژه تخمی و تغییر "سلام" به "SALAM"
-            if self.is_low_quality_project(project):
-                self.log_warning(f"⚠️  پروژه {project_id} تخمی تشخیص داده شد - تغییر سلام به SALAM")
-                # عوض کردن همه "سلام" ها با "SALAM"
-                proposal = proposal.replace('سلام', 'SALAM')
-                proposal = proposal.replace('سلام،', 'SALAM،')
-
-            # ارسال
             result = submitter.submit_proposal(
                 project_id=project_id,
                 description=proposal,
