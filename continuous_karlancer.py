@@ -9,10 +9,10 @@ import os
 import sys
 import json
 import time
-import subprocess
 import requests
 from datetime import datetime
 from pathlib import Path
+from openai import OpenAI
 from telegram_logger import TelegramLogger
 
 # تنظیم encoding
@@ -83,6 +83,13 @@ class ContinuousKarlancer:
             'authorization': f'Bearer {bearer_token}',
             'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         }
+
+        # کلاینت OpenAI-compatible
+        self.ai_client = OpenAI(
+            api_key="sk-IWV6Nh1zA4hc7kcqU88SwAf4XL9jrsOuRVUaPlkoLVBjHb2y",
+            base_url="https://api.gapgpt.app/v1"
+        )
+        self.ai_model = "gapgpt-qwen-3.5"
 
         # فایل‌ها و پوشه‌ها
         self.cache_file = "seen_projects.json"
@@ -287,67 +294,36 @@ class ContinuousKarlancer:
             with open(project_file, 'r', encoding='utf-8') as f:
                 project_text = f.read()
 
-            # ترکیب
-            combined = f"""{system_prompt}
+            self.log_info(f"تحلیل پروژه {project_id} با AI...")
 
-================================================================================
-
-این پروژه جدید از کارلنسر اومده:
-
-{project_text}"""
-
-            # ذخیره temp
-            temp_file = f"temp_{project_id}.txt"
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write(combined)
-
-            self.log_info(f"تحلیل پروژه {project_id} با Claude...")
-
-            # اجرای Claude
+            # ارسال به API
             try:
-                result = subprocess.run(
-                    ['claude', temp_file],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    encoding='utf-8'
+                response = self.ai_client.responses.create(
+                    model=self.ai_model,
+                    instructions=system_prompt,
+                    input=f"این پروژه جدید از کارلنسر اومده:\n\n{project_text}"
                 )
 
-                if result.returncode == 0:
-                    output = result.stdout
+                output = response.output_text
 
-                    # فیلتر noise
-                    clean_output = '\n'.join([
-                        line for line in output.split('\n')
-                        if not any(x in line.lower() for x in ['trust', 'folder', 'security', '────'])
-                    ])
-
-                    if len(clean_output) > 200:
-                        # ذخیره
-                        output_file = self.output_dir / f"project_{project_id}_analysis.txt"
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            f.write(f"""Project ID: {project_id}
+                if output and len(output) > 200:
+                    # ذخیره
+                    output_file = self.output_dir / f"project_{project_id}_analysis.txt"
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(f"""Project ID: {project_id}
 تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ================================================================================
 
-{clean_output}
+{output}
 """)
 
-                        self.log_success(f"تحلیل پروژه {project_id} موفق ({len(clean_output)} chars)")
-                        return output_file
-                    else:
-                        self.log_warning(f"خروجی تحلیل پروژه {project_id} کوتاه است")
+                    self.log_success(f"تحلیل پروژه {project_id} موفق ({len(output)} chars)")
+                    return output_file
                 else:
-                    self.log_error(f"خطای Claude برای پروژه {project_id}: {result.stderr}")
+                    self.log_warning(f"خروجی تحلیل پروژه {project_id} کوتاه است")
 
-            except subprocess.TimeoutExpired:
-                self.log_error(f"Timeout در تحلیل پروژه {project_id}")
             except Exception as e:
-                self.log_error(f"خطا در اجرای Claude: {e}")
-            finally:
-                # حذف temp
-                if Path(temp_file).exists():
-                    Path(temp_file).unlink()
+                self.log_error(f"خطا در اجرای AI: {e}")
 
         except Exception as e:
             self.log_error(f"خطا در تحلیل پروژه {project_id}: {e}")
