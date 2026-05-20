@@ -34,7 +34,10 @@ class ProposalSubmitter:
             'content-type': 'application/json',
             'origin': 'https://www.karlancer.com',
             'referer': 'https://www.karlancer.com/',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+            'sec-ch-ua': '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"'
         }
 
         self.cookies = {
@@ -194,50 +197,42 @@ class ProposalSubmitter:
             with open(analysis_file, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            # پیدا کردن بخش پروپوزال
-            if "📝 پروپوزال" in content or "پروپوزال" in content:
-                # پیدا کردن شروع
-                start_markers = ["📝 پروپوزال", "پروپوزال:", "## پروپوزال"]
-                start_idx = -1
+            # روش ۱: پیدا کردن شروع پروپوزال با سلام یا SALAM
+            # (پرامپت تضمین می‌کند پروپوزال همیشه با یکی از اینها شروع می‌شه)
+            start_idx = -1
+            for marker in ["سلام،", "سلام ،", "سلام\n", "SALAM"]:
+                idx = content.find(marker)
+                if idx != -1:
+                    start_idx = idx
+                    break
 
-                for marker in start_markers:
+            # روش ۲: هدرهای قدیمی (برای فایل‌های قبلی)
+            if start_idx == -1:
+                for marker in ["📝 پروپوزال", "پروپوزال:", "## پروپوزال"]:
                     idx = content.find(marker)
                     if idx != -1:
-                        start_idx = idx
+                        # بعد از هدر، اولین سلام را پیدا کن
+                        after_header = content.find("سلام", idx)
+                        start_idx = after_header if after_header != -1 else idx
                         break
 
-                if start_idx == -1:
-                    return None
+            if start_idx == -1:
+                return None
 
-                # پیدا کردن پایان
-                end_markers = ["💰 محاسبات", "📊 مقایسه", "با تشکر،\nمبین"]
-                end_idx = len(content)
+            # پایان پروپوزال: بعد از امضا
+            end_idx = len(content)
+            for marker in ["💰 محاسبات", "📊 مقایسه"]:
+                idx = content.find(marker, start_idx + 50)
+                if idx != -1 and idx < end_idx:
+                    end_idx = idx
 
-                for marker in end_markers:
-                    idx = content.find(marker, start_idx + 50)
-                    if idx != -1 and idx < end_idx:
-                        end_idx = idx
+            # اگر امضا هست، آنرا هم داخل پروپوزال نگه‌دار
+            signature_marker = "Senior Python Backend Developer"
+            sig_idx = content.find(signature_marker, start_idx)
+            if sig_idx != -1 and sig_idx < end_idx:
+                end_idx = sig_idx + len(signature_marker)
 
-                # استخراج
-                proposal = content[start_idx:end_idx].strip()
-
-                # حذف header
-                lines = proposal.split('\n')
-                clean_lines = []
-                skip_next = False
-
-                for line in lines:
-                    if any(m in line for m in ["📝 پروپوزال", "پروپوزال:", "##", "===", "---"]):
-                        skip_next = True
-                        continue
-                    if skip_next and line.strip() == "":
-                        skip_next = False
-                        continue
-                    clean_lines.append(line)
-
-                return '\n'.join(clean_lines).strip()
-
-            return None
+            return content[start_idx:end_idx].strip()
 
         except Exception as e:
             print(f"❌ Error extracting proposal: {e}")
