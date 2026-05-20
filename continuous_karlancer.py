@@ -12,7 +12,7 @@ import time
 import requests
 from datetime import datetime
 from pathlib import Path
-from openai import OpenAI
+import anthropic
 from telegram_logger import TelegramLogger
 
 # تنظیم encoding
@@ -88,12 +88,8 @@ class ContinuousKarlancer:
             'sec-ch-ua-platform': '"Windows"'
         }
 
-        # کلاینت OpenAI-compatible
-        self.ai_client = OpenAI(
-            api_key="sk-IWV6Nh1zA4hc7kcqU88SwAf4XL9jrsOuRVUaPlkoLVBjHb2y",
-            base_url="https://api.gapgpt.app/v1"
-        )
-        self.ai_model = "gapgpt-qwen-3.5"
+        self.ai_client = anthropic.Anthropic()
+        self.ai_model = "claude-opus-4-7"
 
         # فایل‌ها و پوشه‌ها
         self.cache_file = "seen_projects.json"
@@ -302,13 +298,14 @@ class ContinuousKarlancer:
 
             # ارسال به API
             try:
-                response = self.ai_client.responses.create(
+                response = self.ai_client.messages.create(
                     model=self.ai_model,
-                    instructions=system_prompt,
-                    input=f"این پروژه جدید از کارلنسر اومده:\n\n{project_text}"
+                    max_tokens=4096,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": f"این پروژه جدید از کارلنسر اومده:\n\n{project_text}"}]
                 )
 
-                output = response.output_text
+                output = response.content[0].text
 
                 if output and len(output) > 200:
                     # ذخیره
