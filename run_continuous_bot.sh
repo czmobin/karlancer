@@ -33,13 +33,6 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# بررسی Claude CLI
-if ! command -v claude &> /dev/null; then
-    echo -e "${RED}❌ Claude CLI یافت نشد${NC}"
-    echo "  نصب: https://claude.ai/download"
-    exit 1
-fi
-
 # بررسی فایل prompt
 if [ ! -f "karelancer_prompt.txt" ]; then
     echo -e "${RED}❌ karelancer_prompt.txt یافت نشد${NC}"
