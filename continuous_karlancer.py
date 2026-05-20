@@ -380,8 +380,29 @@ class ContinuousKarlancer:
         """پردازش پروژه‌های جدید"""
         self.log_info("جستجوی پروژه‌های جدید...")
 
-        # دریافت پروژه‌ها
-        all_projects = self.fetch_projects()
+        queries = [
+            "python", "پایتون",
+            "django", "جنگو",
+            "fastapi",
+            "ربات", "bot",
+            "backend", "بک‌اند",
+            "api",
+            "scraping", "اسکرپینگ",
+            "automation", "اتوماسیون",
+            "telegram", "تلگرام",
+            "بله", "روبیکا",
+        ]
+
+        # دریافت پروژه‌ها از همه کلمات کلیدی (بدون تکرار)
+        seen_ids = set()
+        all_projects = []
+        for query in queries:
+            results = self.fetch_projects(query)
+            for p in results:
+                pid = p.get('id')
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_projects.append(p)
 
         if not all_projects:
             self.log_info("هیچ پروژه‌ای دریافت نشد")
