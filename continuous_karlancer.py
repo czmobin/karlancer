@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import traceback
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ os.environ['LC_ALL'] = 'C.UTF-8'
 class ContinuousKarlancer:
     """ربات مداوم کارلنسر"""
 
-    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4, strict_mode: bool = False, telegram_logger: TelegramLogger = None):
+    def __init__(self, bearer_token: str, check_interval: int = 300, auto_submit: bool = False, min_stars: int = 4, strict_mode: bool = False, telegram_logger: TelegramLogger = None, debug: bool = False):
         """
         مقداردهی اولیه
 
@@ -41,6 +42,7 @@ class ContinuousKarlancer:
             min_stars: حداقل امتیاز ستاره برای ارسال خودکار (1-5) - پیش‌فرض: 4
             strict_mode: حالت سخت‌گیرانه برای whitelist (پیش‌فرض: False)
             telegram_logger: logger تلگرام (اختیاری)
+            debug: حالت دیباگ - لاگ کامل و جزئیات بیشتر (پیش‌فرض: False)
         """
         self.bearer_token = bearer_token
         self.check_interval = check_interval
@@ -48,6 +50,7 @@ class ContinuousKarlancer:
         self.min_stars = min_stars
         self.strict_mode = strict_mode
         self.tg = telegram_logger  # Telegram Logger
+        self.debug = debug  # حالت دیباگ
 
         # تکنولوژی‌ها و کلمات کلیدی که باید رد بشن
         self.tech_blacklist = [
@@ -98,6 +101,7 @@ class ContinuousKarlancer:
         self.output_dir = Path("proposals")
         self.tracking_file = "continuous_tracking.json"
         self.log_file = "continuous_bot.log"
+        self.debug_file = "continuous_debug.log"  # لاگ کامل دیباگ (همه چیز)
 
         # ایجاد پوشه‌ها
         self.input_dir.mkdir(exist_ok=True)
@@ -131,8 +135,9 @@ class ContinuousKarlancer:
             if Path(self.tracking_file).exists():
                 with open(self.tracking_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            # قبلاً بی‌صدا بود؛ حالا حداقل توی فایل دیباگ ثبت میشه
+            self._append_debug(f"⚠️  خطا در بارگذاری tracking ({self.tracking_file}): {e}")
         return {
             "total_fetched": 0,
             "total_analyzed": 0,
@@ -155,6 +160,7 @@ class ContinuousKarlancer:
         log_msg = f"[{timestamp}] ℹ️  {message}"
         print(log_msg, flush=True)
         self._append_log(log_msg)
+        self._append_debug(log_msg)
 
     def log_success(self, message: str):
         """لاگ موفقیت"""
@@ -162,6 +168,7 @@ class ContinuousKarlancer:
         log_msg = f"[{timestamp}] ✅ {message}"
         print(log_msg, flush=True)
         self._append_log(log_msg)
+        self._append_debug(log_msg)
 
     def log_error(self, message: str):
         """لاگ خطا"""
@@ -169,6 +176,7 @@ class ContinuousKarlancer:
         log_msg = f"[{timestamp}] ❌ {message}"
         print(log_msg, file=sys.stderr, flush=True)
         self._append_log(log_msg)
+        self._append_debug(log_msg)
 
     def log_warning(self, message: str):
         """لاگ هشدار"""
@@ -176,11 +184,54 @@ class ContinuousKarlancer:
         log_msg = f"[{timestamp}] ⚠️  {message}"
         print(log_msg, flush=True)
         self._append_log(log_msg)
+        self._append_debug(log_msg)
+
+    def log_debug(self, message: str):
+        """لاگ دیباگ - فقط در حالت debug روی کنسول، ولی همیشه توی فایل دیباگ"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"[{timestamp}] 🐞 {message}"
+        if self.debug:
+            print(log_msg, flush=True)
+        self._append_debug(log_msg)
+
+    def log_exception(self, context: str, exc: Exception, notify: bool = False):
+        """
+        لاگ کامل یک استثنا با traceback - تا دقیق معلوم بشه از چی بوده
+
+        Args:
+            context: توضیح اینکه کجا اتفاق افتاد
+            exc: خود استثنا
+            notify: اگه True باشه، خطا به تلگرام هم ارسال میشه
+        """
+        # نوع و پیام استثنا
+        err_type = type(exc).__name__
+        self.log_error(f"{context}: [{err_type}] {exc}")
+
+        # traceback کامل فقط توی فایل دیباگ (تا کنسول شلوغ نشه)
+        tb = traceback.format_exc()
+        self._append_debug(f"---- TRACEBACK ({context}) ----\n{tb}--------")
+        if self.debug:
+            print(tb, file=sys.stderr, flush=True)
+
+        # اطلاع به تلگرام برای خطاهای مهم
+        if notify and self.tg:
+            try:
+                self.tg.send_error(f"{context}\n<code>[{err_type}] {exc}</code>")
+            except Exception:
+                pass
 
     def _append_log(self, message: str):
         """افزودن به فایل لاگ"""
         try:
             with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        except:
+            pass
+
+    def _append_debug(self, message: str):
+        """افزودن به فایل لاگ دیباگ (همیشه فعال - حتی بدون --debug)"""
+        try:
+            with open(self.debug_file, 'a', encoding='utf-8') as f:
                 f.write(message + '\n')
         except:
             pass
@@ -193,6 +244,8 @@ class ContinuousKarlancer:
             'logged_in': '1'
         }
 
+        self.log_debug(f"GET {self.api_url} | query='{query}' | params={params}")
+
         try:
             response = requests.get(
                 self.api_url,
@@ -202,12 +255,58 @@ class ContinuousKarlancer:
             )
             response.encoding = 'utf-8'
 
-            if response.status_code == 200:
+            self.log_debug(f"پاسخ '{query}': HTTP {response.status_code} | {len(response.content)} bytes")
+
+            # 🔴 توکن منقضی/نامعتبر - مهم‌ترین خطایی که قبلاً بی‌صدا بود
+            if response.status_code in (401, 403):
+                self.log_error(
+                    f"احراز هویت رد شد (HTTP {response.status_code}) برای '{query}' - "
+                    f"احتمالاً Bearer token منقضی شده! پاسخ: {response.text[:300]}"
+                )
+                if self.tg:
+                    try:
+                        self.tg.send_error(
+                            f"🔑 توکن کارلنسر رد شد (HTTP {response.status_code})\n"
+                            f"احتمالاً Bearer token منقضی شده — باید آپدیتش کنی."
+                        )
+                    except Exception:
+                        pass
+                return []
+
+            if response.status_code != 200:
+                self.log_error(
+                    f"دریافت '{query}' ناموفق: HTTP {response.status_code} | پاسخ: {response.text[:300]}"
+                )
+                return []
+
+            # تلاش برای پارس JSON
+            try:
                 data = response.json()
-                if data.get("status") == "success":
-                    return data.get("data", {}).get("data", [])
+            except Exception as e:
+                self.log_error(
+                    f"پاسخ '{query}' JSON معتبر نبود: {e} | متن خام: {response.text[:300]}"
+                )
+                return []
+
+            status = data.get("status")
+            if status == "success":
+                projects = data.get("data", {}).get("data", [])
+                self.log_debug(f"'{query}': {len(projects)} پروژه در پاسخ موفق")
+                return projects
+            else:
+                # پاسخ ۲۰۰ ولی status != success - قبلاً کاملاً بی‌صدا رد می‌شد
+                self.log_warning(
+                    f"دریافت '{query}': status='{status}' (موفق نبود) | "
+                    f"message={data.get('message')} | پاسخ: {str(data)[:300]}"
+                )
+                return []
+
+        except requests.exceptions.Timeout:
+            self.log_error(f"دریافت '{query}' timeout شد (>15s)")
+        except requests.exceptions.ConnectionError as e:
+            self.log_error(f"خطای اتصال شبکه در دریافت '{query}': {e}")
         except Exception as e:
-            self.log_error(f"خطا در دریافت پروژه‌ها: {e}")
+            self.log_exception(f"خطای ناشناخته در دریافت پروژه‌های '{query}'", e)
 
         return []
 
@@ -295,6 +394,10 @@ class ContinuousKarlancer:
                 project_text = f.read()
 
             self.log_info(f"تحلیل پروژه {project_id} با AI...")
+            self.log_debug(
+                f"AI request پروژه {project_id}: model={self.ai_model} | "
+                f"prompt={len(system_prompt)} chars | project={len(project_text)} chars"
+            )
 
             # ارسال به API
             try:
@@ -304,6 +407,20 @@ class ContinuousKarlancer:
                     system=system_prompt,
                     messages=[{"role": "user", "content": f"این پروژه جدید از کارلنسر اومده:\n\n{project_text}"}]
                 )
+
+                # لاگ اطلاعات پاسخ AI برای دیباگ (مصرف توکن و دلیل توقف)
+                stop_reason = getattr(response, "stop_reason", None)
+                usage = getattr(response, "usage", None)
+                self.log_debug(
+                    f"AI response پروژه {project_id}: stop_reason={stop_reason} | usage={usage}"
+                )
+
+                if not response.content:
+                    self.log_error(
+                        f"پاسخ AI برای پروژه {project_id} خالی بود (content empty) | "
+                        f"stop_reason={stop_reason}"
+                    )
+                    return None
 
                 output = response.content[0].text
 
@@ -321,13 +438,29 @@ class ContinuousKarlancer:
                     self.log_success(f"تحلیل پروژه {project_id} موفق ({len(output)} chars)")
                     return output_file
                 else:
-                    self.log_warning(f"خروجی تحلیل پروژه {project_id} کوتاه است")
+                    # خروجی کوتاه - خود متن رو لاگ کن تا معلوم بشه AI چی گفته
+                    self.log_warning(
+                        f"خروجی تحلیل پروژه {project_id} کوتاه است "
+                        f"({len(output) if output else 0} chars) | stop_reason={stop_reason}"
+                    )
+                    self.log_debug(f"خروجی کوتاه AI پروژه {project_id}: {repr(output)}")
 
+            except anthropic.APIStatusError as e:
+                # خطاهای HTTP از سمت Anthropic (مثلا 429 rate limit، 401 کلید نامعتبر، 529 overloaded)
+                status = getattr(e, "status_code", "?")
+                self.log_exception(
+                    f"خطای API انتروپیک در تحلیل پروژه {project_id} (HTTP {status})",
+                    e, notify=True
+                )
+            except anthropic.APIConnectionError as e:
+                self.log_exception(
+                    f"خطای اتصال به API انتروپیک در تحلیل پروژه {project_id}", e, notify=True
+                )
             except Exception as e:
-                self.log_error(f"خطا در اجرای AI: {e}")
+                self.log_exception(f"خطا در اجرای AI برای پروژه {project_id}", e, notify=True)
 
         except Exception as e:
-            self.log_error(f"خطا در تحلیل پروژه {project_id}: {e}")
+            self.log_exception(f"خطا در تحلیل پروژه {project_id}", e)
 
         return None
 
@@ -357,6 +490,10 @@ class ContinuousKarlancer:
                 proposal = proposal.replace('سلام', 'SALAM')
                 proposal = proposal.replace('سلام،', 'SALAM،')
 
+            self.log_debug(
+                f"ارسال proposal پروژه {project_id}: طول proposal={len(proposal)} chars"
+            )
+
             # ارسال
             result = submitter.submit_proposal(
                 project_id=project_id,
@@ -366,15 +503,23 @@ class ContinuousKarlancer:
 
             if result['success']:
                 self.log_success(f"✅ پروژه {project_id} با موفقیت ارسال شد!")
+                self.log_debug(f"پاسخ ارسال پروژه {project_id}: {str(result.get('data'))[:500]}")
                 return True
             else:
+                # خطای سرور موقع ارسال - متن کامل پاسخ مهمه (مثلا 'قبلاً پیشنهاد دادی')
                 self.log_error(f"خطا در ارسال پروژه {project_id}: {result['error']}")
+                if self.tg:
+                    try:
+                        self.tg.send_error(
+                            f"📤 ارسال پروپوزال پروژه {project_id} ناموفق\n"
+                            f"<code>{str(result['error'])[:500]}</code>"
+                        )
+                    except Exception:
+                        pass
                 return False
 
         except Exception as e:
-            self.log_error(f"خطا در ارسال proposal: {e}")
-            import traceback
-            self.log_error(traceback.format_exc())
+            self.log_exception(f"خطا در ارسال proposal پروژه {project_id}", e, notify=True)
             return False
 
     def process_new_projects(self):
@@ -507,6 +652,8 @@ class ContinuousKarlancer:
         self.log_info(f"📤 ارسال خودکار: {'فعال' if self.auto_submit else 'غیرفعال'}")
         self.log_info(f"🔒 حالت: {'سخت‌گیرانه (strict)' if self.strict_mode else 'عادی (normal)'}")
         self.log_info(f"🎯 فیلتر: فقط بر اساس تکنولوژی (blacklist) و بودجه (>1.5M)")
+        self.log_info(f"🐞 حالت دیباگ: {'فعال (verbose)' if self.debug else 'غیرفعال (ولی فایل دیباگ همیشه نوشته میشه)'}")
+        self.log_info(f"📄 لاگ کامل: {self.log_file} | لاگ دیباگ: {self.debug_file}")
         if self.tg:
             self.log_info(f"📱 Telegram Logger: فعال")
         print("=" * 80 + "\n")
@@ -525,7 +672,7 @@ class ContinuousKarlancer:
                 try:
                     self.process_new_projects()
                 except Exception as e:
-                    self.log_error(f"خطا در پردازش: {e}")
+                    self.log_exception(f"خطا در پردازش چرخه #{iteration}", e, notify=True)
 
                 # انتظار برای چرخه بعدی
                 self.log_info(f"😴 استراحت {self.check_interval} ثانیه تا چرخه بعدی...")
@@ -567,6 +714,8 @@ def main():
                        help='Chat ID تلگرام برای دریافت لاگ‌ها')
     parser.add_argument('--once', action='store_true',
                        help='فقط یک بار اجرا شود (بدون loop)')
+    parser.add_argument('--debug', action='store_true',
+                       help='حالت دیباگ: لاگ کامل با traceback و جزئیات HTTP/AI روی کنسول')
 
     args = parser.parse_args()
 
@@ -609,7 +758,8 @@ def main():
         auto_submit=args.auto_submit,
         min_stars=0,  # دیگه استفاده نمیشه - فقط برای سازگاری
         strict_mode=args.strict,
-        telegram_logger=telegram_logger
+        telegram_logger=telegram_logger,
+        debug=args.debug
     )
 
     if args.once:

@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import re
+import traceback
 import requests
 from pathlib import Path
 
@@ -67,8 +68,13 @@ class ProposalSubmitter:
                         'max_budget': project.get('max_budget', 0),
                         'job_duration': project.get('job_duration', 1)
                     }
+                else:
+                    print(f"⚠️  دریافت اطلاعات پروژه {project_id}: status={data.get('status')} | {str(data)[:200]}")
+            else:
+                print(f"⚠️  دریافت اطلاعات پروژه {project_id} ناموفق: HTTP {response.status_code} | {response.text[:200]}")
         except Exception as e:
             print(f"⚠️  خطا در دریافت اطلاعات پروژه از API: {e}")
+            print(traceback.format_exc())
 
         return None
 
@@ -179,15 +185,23 @@ class ProposalSubmitter:
                     'data': response.json()
                 }
             else:
+                # متن کامل پاسخ مهمه: معمولاً سرور دلیل رد رو همینجا میگه
+                # (مثلا «قبلاً پیشنهاد دادی»، «بودجه نامعتبر»، «احراز هویت»)
                 return {
                     'success': False,
-                    'error': f"HTTP {response.status_code}: {response.text}"
+                    'error': f"HTTP {response.status_code}: {response.text}",
+                    'status_code': response.status_code
                 }
 
+        except requests.exceptions.Timeout:
+            return {'success': False, 'error': "Timeout (>10s) موقع ارسال proposal"}
+        except requests.exceptions.ConnectionError as e:
+            return {'success': False, 'error': f"خطای اتصال شبکه: {e}"}
         except Exception as e:
             return {
                 'success': False,
-                'error': str(e)
+                'error': f"[{type(e).__name__}] {e}",
+                'traceback': traceback.format_exc()
             }
 
     def extract_proposal_from_analysis(self, analysis_file: str):
