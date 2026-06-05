@@ -197,42 +197,63 @@ class ProposalSubmitter:
             with open(analysis_file, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            # روش ۱: پیدا کردن شروع پروپوزال با سلام یا SALAM
-            # (پرامپت تضمین می‌کند پروپوزال همیشه با یکی از اینها شروع می‌شه)
+            # --- پیدا کردن شروع پروپوزال ---
+            # مدل ممکنه سلام رو به شکل‌های مختلف بنویسه:
+            #   "سلام،"، "سلام وقت بخیر،"، "**سلام،**"، "درود"، "SALAM"
+            # پس به جای مارکر دقیق، با regex دنبال خود کلمه‌ی سلام/درود/SALAM می‌گردیم.
+            greeting_re = re.compile(r'(?:\*\*|#+\s*)?(سلام|درود|SALAM)')
+
+            # اگر هدر بخش پروپوزال وجود داره، اول بعد از اون دنبال سلام بگرد
+            # (تا اشتباهاً سلامِ احتمالیِ داخل بخش تحلیل گرفته نشه)
             start_idx = -1
-            for marker in ["سلام،", "سلام ،", "سلام\n", "SALAM"]:
-                idx = content.find(marker)
-                if idx != -1:
-                    start_idx = idx
-                    break
+            header = re.search(r'(?:📝\s*)?پروپوزال', content)
+            if header:
+                m = greeting_re.search(content, header.end())
+                if m:
+                    start_idx = m.start(1)
 
-            # روش ۲: هدرهای قدیمی (برای فایل‌های قبلی)
+            # اگر هنوز پیدا نشد، کل متن رو جستجو کن
             if start_idx == -1:
-                for marker in ["📝 پروپوزال", "پروپوزال:", "## پروپوزال"]:
-                    idx = content.find(marker)
-                    if idx != -1:
-                        # بعد از هدر، اولین سلام را پیدا کن
-                        after_header = content.find("سلام", idx)
-                        start_idx = after_header if after_header != -1 else idx
-                        break
+                m = greeting_re.search(content)
+                if m:
+                    start_idx = m.start(1)
+
+            # fallback نهایی: اگر فقط هدر پروپوزال هست ولی سلامی نیست،
+            # از خط بعد از هدر شروع کن
+            if start_idx == -1 and header:
+                nl = content.find('\n', header.end())
+                start_idx = nl + 1 if nl != -1 else header.end()
 
             if start_idx == -1:
+                preview = content[:200].replace('\n', ' ')
+                print(f"⚠️  نشانه‌ی پروپوزال (سلام/درود/SALAM/پروپوزال) پیدا نشد. شروع فایل: {preview}")
                 return None
 
-            # پایان پروپوزال: بعد از امضا
+            # --- پیدا کردن پایان پروپوزال ---
             end_idx = len(content)
-            for marker in ["💰 محاسبات", "📊 مقایسه"]:
+            for marker in ["💰 محاسبات", "📊 مقایسه", "محاسبات:", "## محاسبات",
+                           "### محاسبات", "**محاسبات"]:
                 idx = content.find(marker, start_idx + 50)
                 if idx != -1 and idx < end_idx:
                     end_idx = idx
 
-            # اگر امضا هست، آنرا هم داخل پروپوزال نگه‌دار
-            signature_marker = "Senior Python Backend Developer"
-            sig_idx = content.find(signature_marker, start_idx)
-            if sig_idx != -1 and sig_idx < end_idx:
-                end_idx = sig_idx + len(signature_marker)
+            # اگر امضا هست، آنرا هم داخل پروپوزال نگه‌دار و بعد از آن قطع کن
+            for sig in ["Senior Python Backend Developer", "مبین اقایی", "مبین آقایی"]:
+                sig_idx = content.find(sig, start_idx)
+                if sig_idx != -1 and sig_idx < end_idx:
+                    end_idx = sig_idx + len(sig)
+                    break
 
-            return content[start_idx:end_idx].strip()
+            proposal = content[start_idx:end_idx].strip()
+
+            # پاکسازی markdown اضافی فقط از خط اول (مثلا **سلام،** یا ## سلام)
+            lines = proposal.split('\n')
+            if lines:
+                lines[0] = re.sub(r'^[#*\s]+', '', lines[0])   # حذف # و * ابتدای خط
+                lines[0] = re.sub(r'\*+$', '', lines[0]).rstrip()  # حذف ** انتهای خط
+                proposal = '\n'.join(lines).strip()
+
+            return proposal if proposal else None
 
         except Exception as e:
             print(f"❌ Error extracting proposal: {e}")

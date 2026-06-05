@@ -347,7 +347,17 @@ class ContinuousKarlancer:
             proposal = submitter.extract_proposal_from_analysis(str(analysis_file))
 
             if not proposal:
-                self.log_error(f"نمی‌توان proposal از فایل {analysis_file} استخراج کرد")
+                # برای دیباگ: نمایش ابتدای فایل تا ببینیم فرمت خروجی چی شده
+                preview = ""
+                try:
+                    with open(analysis_file, 'r', encoding='utf-8') as f:
+                        preview = f.read()[:300].replace('\n', ' ')
+                except Exception:
+                    pass
+                self.log_error(
+                    f"نمی‌توان proposal از فایل {analysis_file} استخراج کرد"
+                    + (f" | شروع فایل: {preview}" if preview else "")
+                )
                 return False
 
             # 🎯 تشخیص پروژه تخمی و تغییر "سلام" به "SALAM"
