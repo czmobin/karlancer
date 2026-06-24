@@ -36,6 +36,47 @@ for key in ('all_proxy', 'ALL_PROXY'):
 
 
 # ---------------------------------------------------------------------------
+# Claude CLI helper (rate-limit aware)
+# ---------------------------------------------------------------------------
+
+def run_claude(model: str, prompt: str, timeout: int = 300, log_fn=None) -> subprocess.CompletedProcess | None:
+    while True:
+        try:
+            result = subprocess.run(
+                ['claude', '-p', '--model', model],
+                input=prompt, capture_output=True, text=True,
+                timeout=timeout, encoding='utf-8',
+            )
+        except subprocess.TimeoutExpired:
+            if log_fn:
+                log_fn(f"Timeout Claude CLI ({timeout}s)")
+            return None
+        except Exception as e:
+            if log_fn:
+                log_fn(f"خطا در اجرای Claude: {e}")
+            return None
+
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if 'rate limit' in output or '429' in output or 'too many' in output or 'overloaded' in output:
+            wait = 60
+            m = re.search(r'(\d+)\s*(?:second|ثانیه|sec)', output)
+            if m:
+                wait = int(m.group(1)) + 5
+            else:
+                m = re.search(r'(\d+)\s*(?:minute|دقیقه|min)', output)
+                if m:
+                    wait = int(m.group(1)) * 60 + 5
+            ts = datetime.now().strftime('%H:%M:%S')
+            print(f"[{ts}] ⏳ Claude rate limit — خواب {wait} ثانیه...", flush=True)
+            if log_fn:
+                log_fn(f"Claude rate limit — خواب {wait} ثانیه")
+            time.sleep(wait)
+            continue
+
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Telegram Logger
 # ---------------------------------------------------------------------------
 
@@ -118,6 +159,431 @@ class TelegramLogger:
 
 
 # ---------------------------------------------------------------------------
+# Chat Manager
+# ---------------------------------------------------------------------------
+
+class ChatManager:
+
+    ROOMS_API = "https://www.karlancer.com/api/rooms/"
+    MESSAGES_API_TPL = "https://www.karlancer.com/api/rooms/{}/messages-pg"
+    SEND_API = "https://www.karlancer.com/api/messages"
+    MY_USER_ID = 100660
+
+    GITHUB_API = "https://api.github.com"
+
+    def __init__(self, headers: dict, submit_headers: dict, cookies: dict,
+                 model: str = "sonnet", tg: TelegramLogger = None,
+                 github_token: str = ""):
+        self.headers = headers
+        self.submit_headers = submit_headers
+        self.cookies = cookies
+        self.model = model
+        self.tg = tg
+        self.github_token = github_token
+        self.github_user = "czmobin"
+
+        self.chats_dir = Path("chats")
+        self.chats_dir.mkdir(exist_ok=True)
+        self.chat_prompt = self._load_chat_prompt()
+
+    def _load_chat_prompt(self) -> str:
+        path = Path("chat_prompt.txt")
+        if path.exists():
+            return path.read_text(encoding='utf-8')
+        return ""
+
+    # -- logging (standalone) ---------------------------------------------------
+
+    def _log(self, level: str, msg: str):
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        icons = {"info": "INFO", "success": "OK", "warning": "WARN", "error": "ERR"}
+        tag = icons.get(level, "---")
+        line = f"[{ts}] [{tag}] [chat] {msg}"
+        print(line, flush=True)
+        try:
+            with open("karlancer.log", 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        except Exception:
+            pass
+
+    # -- API helpers ------------------------------------------------------------
+
+    def _fetch_rooms(self, pages: int = 2) -> list:
+        rooms = []
+        for page in range(1, pages + 1):
+            try:
+                resp = requests.get(
+                    self.ROOMS_API, headers=self.headers, cookies=self.cookies,
+                    params={"page": page}, timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {}).get("data", [])
+                    rooms.extend(data)
+            except Exception as e:
+                self._log("error", f"دریافت اتاق‌ها صفحه {page}: {e}")
+        return rooms
+
+    def _fetch_messages(self, room_id: int) -> tuple:
+        try:
+            resp = requests.get(
+                self.MESSAGES_API_TPL.format(room_id),
+                headers=self.headers, cookies=self.cookies,
+                params={"page": 1}, timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                messages = data.get("messages", {}).get("data", [])
+                projects = data.get("workdiary_projects", [])
+                return messages, projects
+        except Exception as e:
+            self._log("error", f"دریافت پیام‌های اتاق {room_id}: {e}")
+        return [], []
+
+    def _send_message(self, room_id: int, receptor_id: int, message: str) -> bool:
+        try:
+            resp = requests.post(
+                self.SEND_API, headers=self.submit_headers, cookies=self.cookies,
+                json={"receptor_id": receptor_id, "room_id": room_id,
+                      "message": message, "file": ""},
+                timeout=10,
+            )
+            return resp.status_code in (200, 201)
+        except Exception as e:
+            self._log("error", f"ارسال پیام به اتاق {room_id}: {e}")
+            return False
+
+    # -- state persistence ------------------------------------------------------
+
+    def _room_dir(self, room_id: int) -> Path:
+        d = self.chats_dir / str(room_id)
+        d.mkdir(exist_ok=True)
+        return d
+
+    def _load_state(self, room_dir: Path) -> dict:
+        sf = room_dir / "state.json"
+        if sf.exists():
+            try:
+                with open(sf, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"last_responded_msg_id": 0, "status": "active"}
+
+    def _save_state(self, room_dir: Path, state: dict):
+        with open(room_dir / "state.json", 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+
+    # -- context building -------------------------------------------------------
+
+    def _get_project_context(self, projects: list) -> str:
+        if not projects:
+            return ""
+        project = projects[0]
+        pid = project.get("project_id")
+        title = project.get("title", "")
+        input_file = Path(f"claude_input/project_{pid}.txt")
+        if input_file.exists():
+            return f"اطلاعات پروژه:\n{input_file.read_text(encoding='utf-8')}"
+        return f"پروژه: {title}" if title else ""
+
+    def _get_proposal_context(self, projects: list) -> str:
+        if not projects:
+            return ""
+        pid = projects[0].get("project_id")
+        analysis_file = Path(f"proposals/project_{pid}_analysis.txt")
+        if analysis_file.exists():
+            content = analysis_file.read_text(encoding='utf-8')
+            marker = "پروپوزال"
+            idx = content.find(marker)
+            if idx != -1:
+                proposal = content[idx:idx + 2000]
+                return f"پروپوزال ارسال‌شده:\n{proposal}"
+        return ""
+
+    def _format_conversation(self, messages: list) -> str:
+        lines = []
+        for msg in reversed(messages):
+            role = "من" if msg["sender_id"] == self.MY_USER_ID else "کارفرما"
+            text = msg.get("message", "")
+            if msg.get("file"):
+                fname = msg["file"].get("name", "فایل")
+                text += f" [فایل: {fname}]"
+            lines.append(f"{role}: {text}")
+        return "\n".join(lines)
+
+    # -- GitHub repo management -------------------------------------------------
+
+    def _slugify(self, text: str, max_len: int = 40) -> str:
+        text = re.sub(r'[^\w\s-]', '', text)
+        text = re.sub(r'[\s_]+', '-', text.strip())
+        return text[:max_len].strip('-').lower() or 'project'
+
+    def _create_repo(self, project_title: str, project_desc: str) -> str | None:
+        if not self.github_token:
+            self._log("warning", "GITHUB_TOKEN نیست — ریپو ساخته نشد")
+            return None
+
+        repo_name = f"kar-{self._slugify(project_title)}"
+        gh_headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+
+        try:
+            resp = requests.post(
+                f"{self.GITHUB_API}/user/repos", headers=gh_headers,
+                json={"name": repo_name, "private": True,
+                      "description": project_desc[:200], "auto_init": True},
+                timeout=15,
+            )
+            if resp.status_code == 201:
+                self._log("success", f"ریپو ساخته شد: {repo_name}")
+                return repo_name
+            elif resp.status_code == 422:
+                self._log("info", f"ریپو {repo_name} قبلا وجود داره")
+                return repo_name
+            else:
+                self._log("error", f"ساخت ریپو: HTTP {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            self._log("error", f"ساخت ریپو: {e}")
+        return None
+
+    def _generate_initial_code(self, repo_name: str, project_ctx: str,
+                               room_dir: Path) -> bool:
+        repo_path = room_dir / "repo"
+        if repo_path.exists():
+            return True
+
+        prompt = (
+            "بر اساس توضیحات پروژه زیر، یک ساختار اولیه پروژه پایتون بساز.\n"
+            "فقط فایل‌های کد رو بنویس، هر فایل رو با === filename === مشخص کن.\n"
+            "ساختار ساده و MVP باشه. README.md فارسی بنویس.\n\n"
+            f"{project_ctx}"
+        )
+
+        result = run_claude(self.model, prompt, timeout=180,
+                            log_fn=lambda msg: self._log("error", msg))
+        if not result or result.returncode != 0:
+            self._log("error", "تولید کد اولیه ناموفق")
+            return False
+
+        raw = result.stdout.strip()
+
+        try:
+            repo_path.mkdir(parents=True, exist_ok=True)
+            current_file = None
+            current_content = []
+
+            for line in raw.split('\n'):
+                if line.strip().startswith('=== ') and line.strip().endswith(' ==='):
+                    if current_file:
+                        fpath = repo_path / current_file
+                        fpath.parent.mkdir(parents=True, exist_ok=True)
+                        fpath.write_text('\n'.join(current_content), encoding='utf-8')
+                    current_file = line.strip().strip('= ').strip()
+                    current_content = []
+                elif line.strip().startswith('```'):
+                    continue
+                else:
+                    current_content.append(line)
+
+            if current_file:
+                fpath = repo_path / current_file
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.write_text('\n'.join(current_content), encoding='utf-8')
+
+            if not any(repo_path.iterdir()):
+                (repo_path / "main.py").write_text("# MVP\n", encoding='utf-8')
+                (repo_path / "README.md").write_text("# پروژه\n", encoding='utf-8')
+
+            self._log("success", f"کد اولیه تولید شد: {repo_path}")
+            return True
+        except Exception as e:
+            self._log("error", f"ذخیره کد اولیه: {e}")
+            return False
+
+    def _push_to_repo(self, repo_name: str, room_dir: Path) -> bool:
+        repo_path = room_dir / "repo"
+        if not repo_path.exists():
+            return False
+
+        repo_url = f"git@github.com:{self.github_user}/{repo_name}.git"
+
+        try:
+            cmds = [
+                ['git', 'init'],
+                ['git', 'checkout', '-b', 'main'],
+                ['git', 'add', '.'],
+                ['git', 'commit', '-m', 'Initial MVP'],
+                ['git', 'remote', 'add', 'origin', repo_url],
+                ['git', 'push', '-u', 'origin', 'main', '--force'],
+            ]
+            for cmd in cmds:
+                r = subprocess.run(cmd, cwd=repo_path, capture_output=True,
+                                   text=True, timeout=30)
+                if r.returncode != 0 and 'already exists' not in r.stderr:
+                    if cmd[1] not in ('remote',):
+                        self._log("error", f"git {cmd[1]}: {r.stderr[:200]}")
+                        return False
+
+            self._log("success", f"کد به {repo_name} پوش شد")
+            return True
+        except Exception as e:
+            self._log("error", f"پوش به ریپو: {e}")
+            return False
+
+    def _setup_repo_for_room(self, room_id: int, state: dict,
+                              room_dir: Path, projects: list,
+                              project_ctx: str) -> str | None:
+        if state.get("repo_name"):
+            return state["repo_name"]
+
+        if not projects:
+            return None
+
+        title = projects[0].get("title", f"project-{room_id}")
+        desc = project_ctx[:200] if project_ctx else title
+
+        repo_name = self._create_repo(title, desc)
+        if not repo_name:
+            return None
+
+        if self._generate_initial_code(repo_name, project_ctx, room_dir):
+            self._push_to_repo(repo_name, room_dir)
+
+        state["repo_name"] = repo_name
+        return repo_name
+
+    # -- response generation ----------------------------------------------------
+
+    def _generate_response(self, project_ctx: str, proposal_ctx: str,
+                           conversation: str) -> tuple:
+        parts = [self.chat_prompt]
+        if project_ctx:
+            parts.append(project_ctx)
+        if proposal_ctx:
+            parts.append(proposal_ctx)
+        parts.append(f"مکالمه تا الان:\n{conversation}")
+        parts.append("پاسخ من:")
+
+        prompt = "\n\n".join(parts)
+
+        result = run_claude(self.model, prompt, timeout=120,
+                            log_fn=lambda msg: self._log("error", msg))
+        if result and result.returncode == 0:
+            raw = result.stdout.strip()
+            lines = [
+                l for l in raw.split('\n')
+                if not any(x in l.lower() for x in
+                           ['trust', 'folder', 'security', '────'])
+            ]
+            cleaned = '\n'.join(lines).strip()
+
+            approved = False
+            if "[APPROVED]" in cleaned:
+                cleaned = cleaned.replace("[APPROVED]", "").strip()
+                approved = True
+
+            return cleaned or None, approved
+        return None, False
+
+    # -- main loop entry --------------------------------------------------------
+
+    def check_and_respond(self) -> int:
+        self._log("info", "بررسی پیام‌های جدید...")
+        rooms = self._fetch_rooms(pages=2)
+        if not rooms:
+            self._log("info", "هیچ اتاقی دریافت نشد")
+            return 0
+
+        responded = 0
+        for room in rooms:
+            if room.get("is_archived"):
+                continue
+
+            room_id = room["id"]
+            room_dir = self._room_dir(room_id)
+            state = self._load_state(room_dir)
+
+            if state.get("status") == "approved":
+                continue
+
+            last_msg = room.get("last_message", "")
+            if last_msg.startswith("پیشنهاد بر روی پروژه"):
+                continue
+
+            messages, projects = self._fetch_messages(room_id)
+            if not messages:
+                continue
+
+            newest = messages[0]
+            if newest["sender_id"] == self.MY_USER_ID:
+                continue
+            if newest["id"] <= state.get("last_responded_msg_id", 0):
+                continue
+
+            guest = room.get("guest_name", "?")
+            self._log("info", f"اتاق {room_id} ({guest}): پیام جدید، تولید پاسخ...")
+
+            project_ctx = self._get_project_context(projects)
+            proposal_ctx = self._get_proposal_context(projects)
+            conversation = self._format_conversation(messages)
+
+            is_first_contact = not state.get("repo_name")
+
+            repo_name = self._setup_repo_for_room(
+                room_id, state, room_dir, projects, project_ctx
+            )
+
+            if is_first_contact and repo_name:
+                receptor_id = room.get("user_id")
+                self._send_message(room_id, receptor_id, repo_name)
+                self._log("info", f"اتاق {room_id}: تگ ریپو ارسال شد: {repo_name}")
+                self._save_state(room_dir, state)
+                time.sleep(1)
+
+            response, approved = self._generate_response(
+                project_ctx, proposal_ctx, conversation
+            )
+            if not response:
+                self._log("warning", f"اتاق {room_id}: پاسخی تولید نشد")
+                continue
+
+            receptor_id = room.get("user_id")
+            if self._send_message(room_id, receptor_id, response):
+                self._log("success", f"اتاق {room_id} ({guest}): پاسخ ارسال شد")
+                state["last_responded_msg_id"] = newest["id"]
+
+                if approved:
+                    state["status"] = "approved"
+                    self._log("success", f"اتاق {room_id} ({guest}): تایید اولیه!")
+                    if self.tg:
+                        self.tg.send_message(
+                            f"<b>تایید اولیه!</b>\n"
+                            f"اتاق: {room_id}\nکارفرما: {guest}"
+                        )
+
+                self._save_state(room_dir, state)
+
+                log_file = room_dir / "conversation.txt"
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(
+                        f"\n--- {datetime.now().isoformat()} ---\n"
+                        f"کارفرما: {newest.get('message', '')}\n"
+                        f"من: {response}\n"
+                    )
+
+                responded += 1
+                if responded < 10:
+                    time.sleep(3)
+            else:
+                self._log("error", f"اتاق {room_id}: ارسال ناموفق")
+
+        self._log("info", f"بررسی تمام شد. {responded} پاسخ ارسال شد.")
+        return responded
+
+
+# ---------------------------------------------------------------------------
 # Karlancer Bot
 # ---------------------------------------------------------------------------
 
@@ -127,7 +593,7 @@ class Karlancer:
     PROJECT_API = "https://www.karlancer.com/api/publics/projects"
     BIDS_API = "https://www.karlancer.com/api/bids"
 
-    def __init__(self, bearer_token: str, check_interval: int = 300, model: str = "sonnet", tg: TelegramLogger = None):
+    def __init__(self, bearer_token: str, check_interval: int = 300, model: str = "sonnet", tg: TelegramLogger = None, github_token: str = ""):
         self.bearer_token = bearer_token
         self.check_interval = check_interval
         self.model = model
@@ -167,6 +633,13 @@ class Karlancer:
 
         self.seen_projects = self._load_json_set(self.cache_file)
         self.tracking = self._load_tracking()
+        self.bid_project_ids = set()
+
+        self.chat_manager = ChatManager(
+            headers=self.headers, submit_headers=self.submit_headers,
+            cookies=self.cookies, model=self.model, tg=self.tg,
+            github_token=github_token,
+        )
 
     # -- persistence ---------------------------------------------------------
 
@@ -218,6 +691,45 @@ class Karlancer:
         'backend', 'api', 'scraping', 'automation', 'اتوماسیون',
     ]
 
+    # -- bid check -----------------------------------------------------------
+
+    def _fetch_bid_project_ids(self, full: bool = False) -> set:
+        ids = set()
+        max_pages = 999 if full else 3
+        page = 1
+        while page <= max_pages:
+            try:
+                resp = requests.get(
+                    f"{self.BIDS_API}/?page={page}",
+                    headers=self.headers, cookies=self.cookies, timeout=15,
+                )
+                if resp.status_code != 200:
+                    break
+                data = resp.json().get("data", {})
+                bids = data.get("data", [])
+                if not bids:
+                    break
+                for bid in bids:
+                    pid = bid.get("project_id")
+                    if pid:
+                        ids.add(pid)
+                if page >= data.get("last_page", 1):
+                    break
+                page += 1
+            except Exception as e:
+                self.log_error(f"خطا در دریافت bidها (صفحه {page}): {e}")
+                break
+        return ids
+
+    def refresh_bid_cache(self):
+        if not self.bid_project_ids:
+            self.bid_project_ids = self._fetch_bid_project_ids(full=True)
+            self.log_info(f"📋 {len(self.bid_project_ids)} bid موجود بارگذاری شد (کامل)")
+        else:
+            new_ids = self._fetch_bid_project_ids(full=False)
+            self.bid_project_ids.update(new_ids)
+            self.log_info(f"📋 بروزرسانی bidها — مجموع: {len(self.bid_project_ids)}")
+
     # -- fetch ---------------------------------------------------------------
 
     def _fetch_page(self, query: str, page: int = 1) -> tuple[list, int]:
@@ -260,6 +772,7 @@ class Karlancer:
                         seen_ids.add(pid)
                         all_projects.append(p)
 
+        all_projects.sort(key=lambda p: p.get('id', 0), reverse=True)
         self.log_info(f"مجموع {len(all_projects)} پروژه یکتا از {len(self.SEARCH_QUERIES)} کوئری دریافت شد")
         return all_projects
 
@@ -311,38 +824,29 @@ class Karlancer:
 
         self.log_info(f"تحلیل پروژه {project_id} با Claude ({self.model})...")
 
-        try:
-            result = subprocess.run(
-                ['claude', '-p', '--model', self.model],
-                input=combined,
-                capture_output=True, text=True, timeout=300, encoding='utf-8',
+        result = run_claude(self.model, combined, timeout=300, log_fn=self.log_error)
+        if result is None:
+            self.log_error(f"تحلیل پروژه {project_id} ناموفق")
+        elif result.returncode == 0:
+            clean_output = '\n'.join(
+                line for line in result.stdout.split('\n')
+                if not any(x in line.lower() for x in ['trust', 'folder', 'security', '────'])
             )
 
-            if result.returncode == 0:
-                clean_output = '\n'.join(
-                    line for line in result.stdout.split('\n')
-                    if not any(x in line.lower() for x in ['trust', 'folder', 'security', '────'])
+            if len(clean_output) > 200:
+                output_file = self.output_dir / f"project_{project_id}_analysis.txt"
+                output_file.write_text(
+                    f"Project ID: {project_id}\n"
+                    f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"{'=' * 80}\n\n{clean_output}\n",
+                    encoding='utf-8',
                 )
-
-                if len(clean_output) > 200:
-                    output_file = self.output_dir / f"project_{project_id}_analysis.txt"
-                    output_file.write_text(
-                        f"Project ID: {project_id}\n"
-                        f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"{'=' * 80}\n\n{clean_output}\n",
-                        encoding='utf-8',
-                    )
-                    self.log_success(f"تحلیل پروژه {project_id} موفق ({len(clean_output)} chars)")
-                    return output_file
-                else:
-                    self.log_warning(f"خروجی تحلیل پروژه {project_id} کوتاه است")
+                self.log_success(f"تحلیل پروژه {project_id} موفق ({len(clean_output)} chars)")
+                return output_file
             else:
-                self.log_error(f"خطای Claude برای پروژه {project_id}: {result.stderr}")
-
-        except subprocess.TimeoutExpired:
-            self.log_error(f"Timeout در تحلیل پروژه {project_id}")
-        except Exception as e:
-            self.log_error(f"خطا در اجرای Claude: {e}")
+                self.log_warning(f"خروجی تحلیل پروژه {project_id} کوتاه است")
+        else:
+            self.log_error(f"خطای Claude برای پروژه {project_id}: {result.stderr}")
 
         return None
 
@@ -403,6 +907,11 @@ class Karlancer:
     # -- submit --------------------------------------------------------------
 
     def submit_proposal(self, project_id: int, project: dict, analysis_file: Path) -> bool:
+        # چک کن قبلا bid فرستادی یا نه
+        if project_id in self.bid_project_ids:
+            self.log_warning(f"پروژه {project_id} قبلاً bid داره — رد شد")
+            return False
+
         proposal = self.extract_proposal(analysis_file)
         if not proposal:
             self.log_error(f"نمی‌توان پروپوزال پروژه {project_id} رو استخراج کرد")
@@ -423,7 +932,20 @@ class Karlancer:
         budget = project.get('min_budget', 2_500_000)
         duration = project.get('job_duration', 7)
 
-        self.log_info(f"📤 ارسال پروپوزال پروژه {project_id} (بودجه: {budget:,} تومان، {duration} روز)")
+        # ساخت milestones: پیش‌پرداخت + فازهای تحویل
+        prepay = int(budget * 0.3)
+        remaining = budget - prepay
+        milestones = [{"description": "پیش پرداخت", "duration": "1", "budget": str(prepay)}]
+        if duration > 7:
+            half = remaining // 2
+            d1 = max(1, duration // 2)
+            d2 = max(1, duration - d1)
+            milestones.append({"description": "تحویل مرحله اول", "duration": str(d1), "budget": str(half)})
+            milestones.append({"description": "تحویل نهایی", "duration": str(d2), "budget": str(remaining - half)})
+        else:
+            milestones.append({"description": "تحویل کامل پروژه", "duration": str(max(1, duration - 1)), "budget": str(remaining)})
+
+        self.log_info(f"📤 ارسال پروپوزال پروژه {project_id} (بودجه: {budget:,} تومان، {duration} روز، {len(milestones)} مرحله)")
 
         payload = {
             "project_id": project_id,
@@ -433,7 +955,7 @@ class Karlancer:
             "is_multi": False,
             "description": proposal,
             "edit_cart_id": None,
-            "milestones": [{"description": "انجام کامل پروژه", "duration": str(duration), "budget": str(budget)}],
+            "milestones": milestones,
         }
 
         try:
@@ -448,17 +970,93 @@ class Karlancer:
             self.log_error(f"خطا در ارسال پروپوزال: {e}")
             return False
 
+    # -- relevance filter ----------------------------------------------------
+
+    SKIP_KEYWORDS = [
+        'ادمین', 'تولید محتوا', 'اینستاگرام', 'مدیریت پیج', 'مدیریت شبکه',
+        'سئو', 'گرافیک', 'لوگو', 'تدوین', 'موشن', 'انیمیشن',
+        'تبلیغات', 'کمپین', 'بازاریابی', 'مارکتینگ', 'دیجیتال مارکتینگ',
+        'ترجمه', 'مترجم', 'تایپ', 'نویسندگی', 'نگارش', 'مقاله', 'ویراستاری',
+        'فتوشاپ', 'ایلوستریتور', 'کورل', 'افتر افکت', 'پریمیر',
+        'حسابداری', 'منشی', 'دستیار مجازی', 'پاسخگویی',
+        'طراحی لوگو', 'طراحی بنر', 'طراحی پوستر', 'طراحی لباس',
+        'دکوراسیون', 'معماری', 'عمران', 'سازه', 'تیزر',
+        'کپی رایتینگ', 'بلاگ', 'شبکه اجتماعی', 'پاورپوینت',
+        'اکسل', 'ورد', 'صدا', 'دوبله', 'گویندگی',
+    ]
+
+    TECH_SKILLS = {
+        'python', 'پایتون', 'django', 'fastapi', 'flask',
+        'javascript', 'جاوا اسکریپت', 'typescript', 'react', 'react js', 'next js', 'vue', 'angular', 'node',
+        'php', 'پی اچ پی', 'laravel',
+        'java', 'c#', 'c++', 'go', 'rust', 'swift', 'kotlin',
+        'android', 'اندروید', 'ios', 'flutter', 'react native',
+        'backend', 'front end', 'فرانت اند', 'بک اند',
+        'html5', 'css', 'برنامه نویسی', 'برنامه نویسی وب', 'کدنویسی',
+        'ربات', 'ساخت ربات', 'طراحی ربات',
+        'هوش مصنوعی', 'ماشین لرنینگ', 'بینایی ماشین', 'متخصص هوش مصنوعی',
+        'ساخت اپلیکیشن', 'طراحی اپلیکیشن موبایل',
+        'api', 'docker', 'devops', 'linux', 'git',
+        'sql', 'postgresql', 'mongodb', 'redis', 'mysql',
+        'تحلیل داده', 'data', 'scraping', 'اسکریپینگ',
+        'آردوینو', 'میکروکنترلر', 'arduino', 'stm32', 'arm', 'avr', 'الکترونیک',
+        'telegram', 'bot', 'chatbot',
+        'wordpress', 'وردپرس', 'ووکامرس',
+        'طراحی سایت', 'طراحی وب', 'برنامه نویسی php',
+        'unity', 'unity3d', 'game development', 'بازی سازی',
+        'matlab', 'matlab programming', 'متلب',
+        'crm', 'مدیریت ارتباط با مشتری',
+    }
+
+    FA_DIGITS = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
+
+    def _is_too_old(self, project: dict) -> bool:
+        past = project.get('past_time') or ''
+        normalized = past.translate(self.FA_DIGITS)
+        if 'هفته' in normalized or 'ماه' in normalized or 'سال' in normalized:
+            return True
+        m = re.search(r'(\d+)\s*روز', normalized)
+        if m and int(m.group(1)) >= 5:
+            return True
+        return False
+
+    def _is_relevant(self, project: dict) -> bool:
+        if self._is_too_old(project):
+            return False
+
+        skills = project.get('skills', [])
+        if skills:
+            skill_names = {s.get('name', '').lower() for s in skills}
+            has_tech = any(ts in name for name in skill_names for ts in self.TECH_SKILLS)
+            if has_tech:
+                return True
+            return False
+
+        title = project.get('title', '')
+        desc = project.get('description', '')
+        text = f"{title} {desc}"
+        if any(kw in text for kw in self.SKIP_KEYWORDS):
+            return False
+
+        return True
+
     # -- process -------------------------------------------------------------
 
     def process_new_projects(self):
         self.log_info("جستجوی پروژه‌های جدید...")
+        self.refresh_bid_cache()
 
         all_projects = self.fetch_projects()
         if not all_projects:
             self.log_info("هیچ پروژه‌ای دریافت نشد")
             return
 
-        new_projects = [p for p in all_projects if p.get('id') and p['id'] not in self.seen_projects]
+        new_projects = [
+            p for p in all_projects
+            if p.get('id') and p['id'] not in self.seen_projects
+            and p['id'] not in self.bid_project_ids
+            and self._is_relevant(p)
+        ]
         if not new_projects:
             self.log_info(f"تمام {len(all_projects)} پروژه قبلاً دیده شده‌اند")
             return
@@ -532,19 +1130,72 @@ class Karlancer:
             f"{t['total_failed']} خطا"
         )
 
+    # -- single project ------------------------------------------------------
+
+    def _resolve_project_slug(self, raw: str) -> str:
+        if 'karlancer.com/' in raw:
+            parts = raw.rstrip('/').split('/')
+            return parts[-1]
+        return raw
+
+    def process_single_project(self, raw_id: str):
+        slug = self._resolve_project_slug(raw_id)
+        self.log_info(f"پردازش تکی پروژه {slug}...")
+        self.refresh_bid_cache()
+
+        try:
+            resp = requests.get(
+                f"{self.PROJECT_API}/{slug}",
+                headers=self.headers, cookies=self.cookies, timeout=15,
+            )
+            resp.encoding = 'utf-8'
+            if resp.status_code != 200:
+                self.log_error(f"دریافت پروژه ناموفق: HTTP {resp.status_code}")
+                return
+            project = resp.json().get("data", resp.json())
+        except Exception as e:
+            self.log_error(f"خطا در دریافت پروژه: {e}")
+            return
+
+        project_id = project.get('id')
+        title = project.get('title', 'بدون عنوان')
+        print("=" * 80)
+        self.log_info(f"پروژه {project_id}: {title}")
+        print("=" * 80)
+
+        saved = self.save_project(project)
+        if not saved:
+            return
+
+        analysis_file = self.analyze_project(project_id)
+        if not analysis_file:
+            return
+
+        submitted = self.submit_proposal(project_id, project, analysis_file)
+        if submitted:
+            self.seen_projects.add(project_id)
+            self._save_cache()
+            if self.tg:
+                self.tg.send_project_submitted(project_id, title)
+        print("=" * 80)
+
     # -- main loop -----------------------------------------------------------
 
-    def run(self, once: bool = False):
+    def run(self, once: bool = False, chat_only: bool = False):
         self.log_success("🚀 ربات کارلنسر شروع شد")
         self.log_info(f"⏰ فاصله بررسی: {self.check_interval} ثانیه ({self.check_interval // 60} دقیقه)")
         self.log_info(f"🧠 مدل: {self.model}")
+        if chat_only:
+            self.log_info("💬 حالت فقط چت فعال است")
         if self.tg:
             self.log_info("📱 Telegram Logger: فعال")
             self.tg.send_startup(self.check_interval)
         print("=" * 80 + "\n")
 
         if once:
-            self.process_new_projects()
+            if not chat_only:
+                self.process_new_projects()
+            self.chat_manager.check_and_respond()
             return
 
         iteration = 0
@@ -553,10 +1204,16 @@ class Karlancer:
                 iteration += 1
                 self.log_info(f"🔄 چرخه #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+                if not chat_only:
+                    try:
+                        self.process_new_projects()
+                    except Exception as e:
+                        self.log_error(f"خطا در پردازش پروژه‌ها: {e}")
+
                 try:
-                    self.process_new_projects()
+                    self.chat_manager.check_and_respond()
                 except Exception as e:
-                    self.log_error(f"خطا در پردازش: {e}")
+                    self.log_error(f"خطا در پردازش چت‌ها: {e}")
 
                 self.log_info(f"😴 استراحت {self.check_interval} ثانیه تا چرخه بعدی...")
                 time.sleep(self.check_interval)
@@ -629,9 +1286,21 @@ def main():
                         help='فقط یک بار اجرا بشه (بدون loop)')
     parser.add_argument('--telegram-chat-id', type=str,
                         help='Chat ID تلگرام')
+    parser.add_argument('--chat-only', action='store_true',
+                        help='فقط چت‌ها رو بررسی کن (بدون ارسال پروپوزال)')
+    parser.add_argument('--project', type=str,
+                        help='پردازش یک پروژه خاص (URL، slug یا ID عددی)')
+    parser.add_argument('--no-proxy', action='store_true',
+                        help='بدون پروکسی (اتصال مستقیم)')
     parser.add_argument('--setup-telegram', action='store_true',
                         help='دریافت Chat ID تلگرام')
     args = parser.parse_args()
+
+    if args.no_proxy:
+        for key in ('all_proxy', 'ALL_PROXY', 'http_proxy', 'HTTP_PROXY',
+                     'https_proxy', 'HTTPS_PROXY', 'ftp_proxy', 'FTP_PROXY'):
+            os.environ.pop(key, None)
+        print("🔌 پروکسی غیرفعال شد — اتصال مستقیم")
 
     if args.setup_telegram:
         setup_telegram()
@@ -665,8 +1334,17 @@ def main():
     else:
         print("ℹ️  Telegram Logger غیرفعال (برای فعال‌سازی: python3 karlancer.py --setup-telegram)")
 
-    bot = Karlancer(bearer_token=bearer, check_interval=args.interval, model=args.model, tg=tg)
-    bot.run(once=args.once)
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if github_token:
+        print("🐙 GitHub Token: فعال")
+
+    bot = Karlancer(bearer_token=bearer, check_interval=args.interval, model=args.model, tg=tg, github_token=github_token)
+
+    if args.project:
+        bot.process_single_project(args.project)
+        return
+
+    bot.run(once=args.once, chat_only=args.chat_only)
 
 
 if __name__ == "__main__":

@@ -146,6 +146,13 @@ Senior Python Backend Developer
 - Break down phases for complex projects
 - Never promise unrealistic delivery
 
+**Server Cost Notice:**
+اگر پروژه نیاز به سرور داره (وب‌اپ، API، ربات ۲۴ ساعته، دیتابیس آنلاین و...) حتماً در پروپوزال به کارفرما بگو که:
+- سرور جداگانه نیاز داره و چرا (مثلاً: "برای اینکه ربات ۲۴ ساعته آنلاین باشه نیاز به یه سرور داریم" یا "برای هاست کردن API و دیتابیس سرور لازمه")
+- هزینه ماهانه سرور حدوداً ۱ تا ۱.۸ میلیون تومان هست (بسته به مشخصات و لوکیشن)
+- این هزینه جدای از هزینه توسعه پروژه‌ست
+- فقط وقتی بگو که واقعاً سرور لازمه — پروژه‌هایی مثل اسکریپت محلی، اتوماسیون، اسکریپینگ یکبار مصرف و... نیاز به سرور ندارن
+
 ### 4. CRITICAL RULE: ALWAYS Write a Proposal
 
 **You MUST write a proposal for EVERY project, no exceptions.** Even if the budget is low, the tech doesn't match, or the requirements are vague — ALWAYS write a complete proposal.

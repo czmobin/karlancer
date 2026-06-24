@@ -54,3 +54,6 @@ Thumbs.db
 
 # Telegram configuration
 .telegram_chat_id
+
+# Chat state
+chats/
