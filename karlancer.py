@@ -56,8 +56,8 @@ def run_claude(model: str, prompt: str, timeout: int = 300, log_fn=None) -> subp
                 log_fn(f"خطا در اجرای Claude: {e}")
             return None
 
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        if 'rate limit' in output or '429' in output or 'too many' in output or 'overloaded' in output:
+        err = result.stderr.lower()
+        if result.returncode != 0 and ('rate limit' in err or '429' in err or 'too many' in err or 'overloaded' in err):
             wait = 60
             m = re.search(r'(\d+)\s*(?:second|ثانیه|sec)', output)
             if m:
@@ -304,7 +304,7 @@ class ChatManager:
         lines = []
         for msg in reversed(messages):
             role = "من" if msg["sender_id"] == self.MY_USER_ID else "کارفرما"
-            text = msg.get("message", "")
+            text = msg.get("message") or ""
             if msg.get("file"):
                 fname = msg["file"].get("name", "فایل")
                 text += f" [فایل: {fname}]"
@@ -962,6 +962,9 @@ class Karlancer:
             resp = requests.post(self.BIDS_API, headers=self.submit_headers, cookies=self.cookies, json=payload, timeout=10)
             if resp.status_code in [200, 201]:
                 self.log_success(f"پروژه {project_id} با موفقیت ارسال شد!")
+                return True
+            elif resp.status_code == 409:
+                self.log_warning(f"پروژه {project_id} قبلاً پیشنهاد ثبت شده — رد شد")
                 return True
             else:
                 self.log_error(f"خطا در ارسال پروژه {project_id}: HTTP {resp.status_code}: {resp.text}")
