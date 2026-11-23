@@ -185,9 +185,16 @@ class ChatManager:
         self.chats_dir = Path("chats")
         self.chats_dir.mkdir(exist_ok=True)
         self.chat_prompt = self._load_chat_prompt()
+        self.deploy_prompt = self._load_deploy_prompt()
 
     def _load_chat_prompt(self) -> str:
         path = Path("chat_prompt.txt")
+        if path.exists():
+            return path.read_text(encoding='utf-8')
+        return ""
+
+    def _load_deploy_prompt(self) -> str:
+        path = Path("deploy_prompt.txt")
         if path.exists():
             return path.read_text(encoding='utf-8')
         return ""
@@ -314,6 +321,7 @@ class ChatManager:
     # -- GitHub repo management -------------------------------------------------
 
     def _slugify(self, text: str, max_len: int = 40) -> str:
+        text = re.sub(r'[^\x00-\x7F]', '', text)   # فقط ASCII
         text = re.sub(r'[^\w\s-]', '', text)
         text = re.sub(r'[\s_]+', '-', text.strip())
         return text[:max_len].strip('-').lower() or 'project'
@@ -323,7 +331,8 @@ class ChatManager:
             self._log("warning", "GITHUB_TOKEN نیست — ریپو ساخته نشد")
             return None
 
-        repo_name = f"kar-{self._slugify(project_title)}"
+        slug = self._slugify(project_title)
+        repo_name = f"kar-{slug}" if slug != 'project' else f"kar-{abs(hash(project_title)) % 100000}"
         gh_headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
@@ -454,14 +463,54 @@ class ChatManager:
         state["repo_name"] = repo_name
         return repo_name
 
+    # -- SSH deploy -------------------------------------------------------------
+
+    def _ssh_deploy(self, ip: str, user: str, password: str, repo_name: str) -> str | None:
+        try:
+            import paramiko
+        except ImportError:
+            self._log("error", "paramiko نصب نیست: pip install paramiko")
+            return None
+
+        repo_url = f"https://github.com/{self.github_user}/{repo_name}.git"
+        deploy_dir = f"/root/{repo_name}"
+        commands = [
+            f"rm -rf {deploy_dir}",
+            f"git clone {repo_url} {deploy_dir}",
+            f"cd {deploy_dir} && pip3 install -r requirements.txt -q 2>/dev/null || true",
+            f"ls {deploy_dir}",
+        ]
+
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ip, username=user, password=password, timeout=30)
+
+            output_lines = []
+            for cmd in commands:
+                _, stdout, stderr = ssh.exec_command(cmd, timeout=60)
+                out = stdout.read().decode('utf-8', errors='replace').strip()
+                err = stderr.read().decode('utf-8', errors='replace').strip()
+                if out:
+                    output_lines.append(out)
+                if err and 'warning' not in err.lower():
+                    self._log("warning", f"SSH cmd stderr: {err[:200]}")
+            ssh.close()
+            self._log("success", f"دپلوی موفق روی {ip}:{deploy_dir}")
+            return deploy_dir
+        except Exception as e:
+            self._log("error", f"خطای SSH deploy: {e}")
+            return None
+
     # -- response generation ----------------------------------------------------
 
     def _generate_response(self, project_ctx: str, proposal_ctx: str,
-                           conversation: str) -> tuple:
-        parts = [self.chat_prompt]
+                           conversation: str, phase: str = "chat") -> tuple:
+        system = self.deploy_prompt if phase == "deploy" else self.chat_prompt
+        parts = [system]
         if project_ctx:
             parts.append(project_ctx)
-        if proposal_ctx:
+        if proposal_ctx and phase != "deploy":
             parts.append(proposal_ctx)
         parts.append(f"مکالمه تا الان:\n{conversation}")
         parts.append("پاسخ من:")
@@ -484,8 +533,20 @@ class ChatManager:
                 cleaned = cleaned.replace("[APPROVED]", "").strip()
                 approved = True
 
-            return cleaned or None, approved
-        return None, False
+            # استخراج اطلاعات سرور
+            server_info = None
+            m = re.search(r'\[SERVER:\s*ip=(\S+)\s+user=(\S+)\s+pass=(.+?)\]', cleaned)
+            if m:
+                server_info = {"ip": m.group(1), "user": m.group(2), "pass": m.group(3).strip()}
+                cleaned = re.sub(r'\[SERVER:[^\]]+\]', '', cleaned).strip()
+
+            done = False
+            if "[DONE]" in cleaned:
+                cleaned = cleaned.replace("[DONE]", "").strip()
+                done = True
+
+            return cleaned or None, approved, server_info, done
+        return None, False, None, False
 
     # -- main loop entry --------------------------------------------------------
 
@@ -498,89 +559,174 @@ class ChatManager:
 
         responded = 0
         for room in rooms:
-            if room.get("is_archived"):
-                continue
+            try:
+                responded += self._process_room(room)
+            except Exception as e:
+                self._log("error", f"خطا در پردازش اتاق {room.get('id')}: {e}")
 
-            room_id = room["id"]
-            room_dir = self._room_dir(room_id)
-            state = self._load_state(room_dir)
+        self._log("info", f"بررسی تمام شد. {responded} پاسخ ارسال شد.")
+        return responded
 
-            if state.get("status") == "approved":
-                continue
+    def _process_room(self, room: dict) -> int:
+        if room.get("is_archived"):
+            return 0
 
-            last_msg = room.get("last_message", "")
-            if last_msg.startswith("پیشنهاد بر روی پروژه"):
-                continue
+        room_id = room["id"]
+        guest = room.get("guest_name", "?")
+        room_dir = self._room_dir(room_id)
+        state = self._load_state(room_dir)
+        status = state.get("status", "")
 
-            messages, projects = self._fetch_messages(room_id)
-            if not messages:
-                continue
+        # اتاق‌های تمام‌شده
+        if status == "done":
+            return 0
 
-            newest = messages[0]
-            if newest["sender_id"] == self.MY_USER_ID:
-                continue
-            if newest["id"] <= state.get("last_responded_msg_id", 0):
-                continue
+        last_msg = room.get("last_message", "") or ""
+        if last_msg.startswith("پیشنهاد بر روی پروژه"):
+            return 0
+        if "فریلنسر دیگری را روی پروژه" in last_msg or "از حالت تمام وقت خارج شده" in last_msg:
+            if status != "done":
+                state["status"] = "done"
+                self._save_state(room_dir, state)
+                self._log("info", f"اتاق {room_id} ({guest}): کارفرما دیگری رو استخدام کرد — بسته شد")
+            return 0
 
-            guest = room.get("guest_name", "?")
-            self._log("info", f"اتاق {room_id} ({guest}): پیام جدید، تولید پاسخ...")
+        messages, projects = self._fetch_messages(room_id)
+        if not messages:
+            return 0
 
-            project_ctx = self._get_project_context(projects)
-            proposal_ctx = self._get_proposal_context(projects)
-            conversation = self._format_conversation(messages)
+        # --- تشخیص استخدام (workdiary) ---
+        active_wd = [p for p in projects if p.get("status") == "accepted"]
+        if active_wd and status not in ("hired", "deploying", "deployed", "done"):
+            project_title = active_wd[0].get("title", "")
+            wd_id = active_wd[0].get("id", "")
+            state["status"] = "hired"
+            state["workdiary_id"] = wd_id
+            state["workdiary_title"] = project_title
+            self._save_state(room_dir, state)
+            self._log("success", f"اتاق {room_id} ({guest}): استخدام — {project_title}")
+            if self.tg:
+                self.tg.send_message(
+                    f"<b>🎉 استخدام شدی!</b>\n"
+                    f"کارفرما: {guest}\nپروژه: {project_title}\nمیزکار: {wd_id}"
+                )
+            status = "hired"
 
+        newest = messages[0]
+        if newest["sender_id"] == self.MY_USER_ID:
+            return 0
+        if newest["id"] <= state.get("last_responded_msg_id", 0):
+            return 0
+
+        project_ctx = self._get_project_context(projects)
+        proposal_ctx = self._get_proposal_context(projects)
+        conversation = self._format_conversation(messages)
+
+        # --- فاز pre-hire: چت عادی ---
+        if status not in ("hired", "deploying", "deployed"):
             is_first_contact = not state.get("repo_name")
-
             repo_name = self._setup_repo_for_room(
                 room_id, state, room_dir, projects, project_ctx
             )
-
             if is_first_contact and repo_name:
                 receptor_id = room.get("user_id")
                 self._send_message(room_id, receptor_id, repo_name)
-                self._log("info", f"اتاق {room_id}: تگ ریپو ارسال شد: {repo_name}")
+                self._log("info", f"اتاق {room_id}: ریپو ارسال شد: {repo_name}")
                 self._save_state(room_dir, state)
                 time.sleep(1)
 
-            response, approved = self._generate_response(
-                project_ctx, proposal_ctx, conversation
+            response, approved, _, _ = self._generate_response(
+                project_ctx, proposal_ctx, conversation, phase="chat"
             )
             if not response:
                 self._log("warning", f"اتاق {room_id}: پاسخی تولید نشد")
-                continue
+                return 0
 
             receptor_id = room.get("user_id")
             if self._send_message(room_id, receptor_id, response):
-                self._log("success", f"اتاق {room_id} ({guest}): پاسخ ارسال شد")
                 state["last_responded_msg_id"] = newest["id"]
-
                 if approved:
                     state["status"] = "approved"
                     self._log("success", f"اتاق {room_id} ({guest}): تایید اولیه!")
                     if self.tg:
                         self.tg.send_message(
-                            f"<b>تایید اولیه!</b>\n"
-                            f"اتاق: {room_id}\nکارفرما: {guest}"
+                            f"<b>تایید اولیه!</b>\nکارفرما: {guest}\nاتاق: {room_id}"
                         )
-
                 self._save_state(room_dir, state)
+                self._log_conversation(room_dir, newest, response)
+                time.sleep(3)
+                return 1
+            return 0
 
-                log_file = room_dir / "conversation.txt"
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(
-                        f"\n--- {datetime.now().isoformat()} ---\n"
-                        f"کارفرما: {newest.get('message', '')}\n"
-                        f"من: {response}\n"
+        # --- فاز post-hire: دپلوی ---
+        response, _, server_info, done = self._generate_response(
+            project_ctx, "", conversation, phase="deploy"
+        )
+        if not response:
+            return 0
+
+        receptor_id = room.get("user_id")
+
+        # اگه Claude اطلاعات سرور استخراج کرد → دپلوی کن
+        if server_info and status == "hired":
+            self._log("info", f"اتاق {room_id}: اطلاعات سرور دریافت شد، شروع دپلوی...")
+            state["status"] = "deploying"
+            state["server"] = server_info
+            self._save_state(room_dir, state)
+
+            repo_name = state.get("repo_name") or self._setup_repo_for_room(
+                room_id, state, room_dir, projects, project_ctx
+            )
+            deploy_path = None
+            if repo_name:
+                deploy_path = self._ssh_deploy(
+                    server_info["ip"], server_info["user"], server_info["pass"], repo_name
+                )
+
+            if deploy_path:
+                state["status"] = "deployed"
+                state["deploy_path"] = deploy_path
+                self._save_state(room_dir, state)
+                deploy_msg = (
+                    f"کد رو روی سرور شما نصب کردم. مسیر: {deploy_path}\n"
+                    f"لطفاً سرور رو بررسی کنید و بگید همه چیز درسته؟"
+                )
+                self._send_message(room_id, receptor_id, deploy_msg)
+                self._log("success", f"اتاق {room_id}: دپلوی موفق — {deploy_path}")
+                if self.tg:
+                    self.tg.send_message(
+                        f"<b>🚀 دپلوی موفق!</b>\nکارفرما: {guest}\nسرور: {server_info['ip']}\nمسیر: {deploy_path}"
                     )
-
-                responded += 1
-                if responded < 10:
-                    time.sleep(3)
             else:
-                self._log("error", f"اتاق {room_id}: ارسال ناموفق")
+                self._send_message(room_id, receptor_id, response)
+                self._log("warning", f"اتاق {room_id}: دپلوی ناموفق")
+            state["last_responded_msg_id"] = newest["id"]
+            self._save_state(room_dir, state)
+            self._log_conversation(room_dir, newest, response)
+            return 1
 
-        self._log("info", f"بررسی تمام شد. {responded} پاسخ ارسال شد.")
-        return responded
+        if done:
+            state["status"] = "done"
+            self._log("success", f"اتاق {room_id} ({guest}): تمام — پروژه بسته شد")
+            if self.tg:
+                self.tg.send_message(f"<b>✅ پروژه تمام شد!</b>\nکارفرما: {guest}")
+
+        if self._send_message(room_id, receptor_id, response):
+            state["last_responded_msg_id"] = newest["id"]
+            self._save_state(room_dir, state)
+            self._log_conversation(room_dir, newest, response)
+            time.sleep(3)
+            return 1
+        return 0
+
+    def _log_conversation(self, room_dir: Path, newest: dict, response: str):
+        log_file = room_dir / "conversation.txt"
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(
+                f"\n--- {datetime.now().isoformat()} ---\n"
+                f"کارفرما: {newest.get('message') or ''}\n"
+                f"من: {response}\n"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -858,47 +1004,35 @@ class Karlancer:
 
             # حذف هدر فایل تحلیل (Project ID, تاریخ, خط جداکننده)
             header_end = content.find('=' * 40)
-            if header_end != -1:
-                body = content[header_end:].lstrip('= \n')
-            else:
-                body = content
+            body = content[header_end:].lstrip('= \n') if header_end != -1 else content
 
-            # اول سعی کن بخش پروپوزال رو پیدا کنی
-            start_markers = ["📝 پروپوزال", "پروپوزال:", "## پروپوزال"]
+            # پیدا کردن شروع پروپوزال — همیشه با سلام، یا SALAM شروع میشه
             start_idx = -1
-            for marker in start_markers:
+            for marker in ["سلام،", "SALAM"]:
                 idx = body.find(marker)
-                if idx != -1:
+                if idx != -1 and (start_idx == -1 or idx < start_idx):
                     start_idx = idx
+
+            if start_idx == -1:
+                self.log_warning("شروع پروپوزال (سلام/SALAM) پیدا نشد — کل تحلیل ارسال میشه")
+                return body.strip() or None
+
+            # پیدا کردن پایان پروپوزال — بعد از امضا
+            end_markers = ["Senior Python Backend Developer", "# محاسبات", "## محاسبات",
+                           "💰 محاسبات", "[PRICE:", "\n# "]
+            end_idx = len(body)
+            for marker in end_markers:
+                idx = body.find(marker, start_idx + 50)
+                if idx != -1 and idx < end_idx:
+                    # اگه marker پایان بعد از امضاست، اون رو include کن
+                    if marker == "Senior Python Backend Developer":
+                        end_idx = idx + len(marker)
+                    else:
+                        end_idx = idx
                     break
 
-            if start_idx != -1:
-                end_markers = ["💰 محاسبات", "📊 مقایسه", "با تشکر،\nمبین"]
-                end_idx = len(body)
-                for marker in end_markers:
-                    idx = body.find(marker, start_idx + 50)
-                    if idx != -1 and idx < end_idx:
-                        end_idx = idx
-
-                proposal = body[start_idx:end_idx].strip()
-                lines = proposal.split('\n')
-                clean_lines = []
-                skip_next = False
-                for line in lines:
-                    if any(m in line for m in ["📝 پروپوزال", "پروپوزال:", "##", "===", "---"]):
-                        skip_next = True
-                        continue
-                    if skip_next and line.strip() == "":
-                        skip_next = False
-                        continue
-                    clean_lines.append(line)
-                result = '\n'.join(clean_lines).strip()
-                if result:
-                    return result
-
-            # اگه بخش پروپوزال پیدا نشد، کل متن تحلیل رو بفرست
-            self.log_warning("بخش پروپوزال پیدا نشد — کل تحلیل ارسال میشه")
-            return body.strip() or None
+            result = body[start_idx:end_idx].strip()
+            return result or None
 
         except Exception as e:
             self.log_error(f"خطا در استخراج پروپوزال: {e}")
@@ -928,9 +1062,20 @@ class Karlancer:
             self.log_warning(f"پروژه {project_id} بی‌کیفیت - تغییر سلام به SALAM")
             proposal = proposal.replace('سلام', 'SALAM')
 
-        # بودجه و مدت مستقیم از بازه کارفرما
-        budget = project.get('min_budget', 2_500_000)
-        duration = project.get('job_duration', 7)
+        # قیمت و مدت از خروجی Claude — اگه نبود fallback به حداقل
+        analysis_text = ""
+        try:
+            analysis_text = analysis_file.read_text(encoding='utf-8')
+        except Exception:
+            pass
+
+        price_match = re.search(r'\[PRICE:\s*(\d+)\]', analysis_text)
+        dur_match = re.search(r'\[DURATION:\s*(\d+)\]', analysis_text)
+        budget = max(2_500_000, int(price_match.group(1))) if price_match else 2_500_000
+        duration = int(dur_match.group(1)) if dur_match else (project.get('job_duration') or 7)
+
+        if not price_match:
+            self.log_warning(f"پروژه {project_id}: [PRICE] در تحلیل نبود — از حداقل ۲٬۵۰۰٬۰۰۰ استفاده شد")
 
         # ساخت milestones: پیش‌پرداخت + فازهای تحویل
         prepay = int(budget * 0.3)
